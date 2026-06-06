@@ -26,9 +26,9 @@ jobs:
             .buildozer
             ~/.gradle
           # Đổi key thành v2 để bỏ qua toàn bộ rác từ cache cũ
-          key: buildozer-zauto-v2-${{ runner.os }}-${{ github.run_id }}
+          key: buildozer-zauto-v4-${{ runner.os }}-${{ github.run_id }}
           restore-keys: |
-            buildozer-zauto-v2-${{ runner.os }}-
+            buildozer-zauto-v4-${{ runner.os }}-
 
       - name: Cleanup System
         run: |
@@ -91,10 +91,12 @@ jobs:
 
       - name: Install Build Tools
         run: |
-          # Nâng pip host lên bản sạch trước
-          python -m pip install --upgrade pip
-          # Pin buildozer + p4a version ổn định
-          pip install Cython==0.29.36 buildozer==1.5.0 "python-for-android==2024.1.21" virtualenv setuptools wheel
+          # 1. Cài đặt phiên bản pip cũ hơn để tương thích với p4a cũ (quan trọng!)
+          python -m pip install --upgrade "pip<24.0"
+          
+          # 2. Cài đặt các công cụ với phiên bản "khóa cứng" (pin version)
+          # Lưu ý: sh phải < 2.0 theo yêu cầu của python-for-android
+          pip install Cython==0.29.36 buildozer==1.5.0 "python-for-android==2024.1.21" "sh<2.0" virtualenv setuptools==68.0.0 wheel
 
       - name: Create required directories
         run: |
