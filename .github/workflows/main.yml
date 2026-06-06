@@ -123,9 +123,8 @@ jobs:
       - name: Build APK (Release)
         run: |
           mkdir -p ~/.android && touch ~/.android/repositories.cfg
-          # Xóa || true để nếu lệnh này fail, workflow sẽ dừng ngay
-          yes | buildozer android p4a --accept-sdk-license 
-
+          
+          # Cấu hình biến môi trường trước
           export P4A_RELEASE_KEYSTORE=$(pwd)/zauto.keystore
           export P4A_RELEASE_KEYSTORE_PASSWD=zauto123
           export P4A_RELEASE_KEYALIAS_PASSWD=zauto123
@@ -133,8 +132,7 @@ jobs:
           export GRADLE_OPTS="-Xmx4096m -Dorg.gradle.daemon=false"
           export PIP_NO_BUILD_ISOLATION=1
 
-          # Bỏ tee và || true. 
-          # Bây giờ nếu buildozer exit với code khác 0, GitHub sẽ báo đỏ ngay lập tức.
+          # Chỉ giữ lại duy nhất 1 lệnh buildozer này thôi
           buildozer -v android release
 
       - name: Upload APK
