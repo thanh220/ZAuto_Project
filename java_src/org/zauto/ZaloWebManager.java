@@ -1447,7 +1447,7 @@ public class ZaloWebManager {
             "               let btns = document.querySelectorAll('button, div, span');" +
             "               for(let b of btns) { if(b.innerText && (b.innerText.includes('Đồng bộ') || b.innerText.includes('Khôi phục'))) { syncBtn = b; break; } }" +
             "           }" +
-            "           if(syncBtn) syncBtn.click();" +
+            "           if(syncBtn && !window.zauto_sync_clicked) { window.zauto_sync_clicked = true; syncBtn.click(); }" +
             "       } catch(e) {}" +
             "       let isLoginScreen = document.querySelector('.qrcode') || document.querySelector('.login-container');" +
 			"       if(isLoginScreen) {" +
