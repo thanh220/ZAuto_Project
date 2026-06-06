@@ -24,9 +24,10 @@ jobs:
             ~/.buildozer
             .buildozer
             ~/.gradle
-          key: buildozer-zauto-${{ runner.os }}-${{ github.run_id }}
+          # Đổi key thành v2 để bỏ qua toàn bộ rác từ cache cũ
+          key: buildozer-zauto-v2-${{ runner.os }}-${{ github.run_id }}
           restore-keys: |
-            buildozer-zauto-${{ runner.os }}-
+            buildozer-zauto-v2-${{ runner.os }}-
 
       - name: Cleanup System
         run: |
