@@ -5,6 +5,7 @@ on:
     branches:
       - main
   workflow_dispatch:
+  
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -129,7 +130,7 @@ jobs:
           export GRADLE_OPTS="-Xmx4096m -Dorg.gradle.daemon=false"
           export PIP_NO_BUILD_ISOLATION=1   # ← THÊM MỚI
 
-          buildozer -v android release 2>&1 | tee build.log || (cat build.log | tail -100 && exit 1)
+          buildozer -v android release
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
