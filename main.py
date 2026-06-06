@@ -1,2703 +1,1685 @@
-import json, os, re, time, traceback
-import requests
-import hashlib
-import uuid
-import queue
-import threading
-import gc
-import random
-import sqlite3
-import logging
-import urllib.request
-import urllib.error
-import traceback
-from kivy.network.urlrequest import UrlRequest
-import webbrowser
-from logging.handlers import RotatingFileHandler
-from collections import OrderedDict
-from kivy.uix.image import Image
-from kivy.metrics import dp
-from kivy.uix.scrollview import ScrollView
-from kivy.core.clipboard import Clipboard
-from kivy.uix.popup import Popup
-from kivy.uix.boxlayout import BoxLayout
-from kivy.uix.label import Label
-from kivy.uix.textinput import TextInput
-from kivy.uix.button import Button
-from kivy.uix.spinner import Spinner
-from kivymd.app import MDApp
-from kivy.lang import Builder
-from kivy.utils import platform
-from kivy.clock import Clock
-from kivy.core.window import Window
-from kivymd.uix.card import MDCard
-from kivymd.uix.list import TwoLineAvatarIconListItem, ImageLeftWidget
-from kivy.properties import StringProperty, BooleanProperty
-from kivymd.toast import toast
+package org.zauto;
 
+import android.app.Activity;
+import android.content.Context;
+import android.content.Intent;
+import android.os.Handler;
+import android.os.Looper;
+import android.webkit.CookieManager;
+import android.webkit.JavascriptInterface;
+import android.webkit.RenderProcessGoneDetail;
+import android.webkit.WebChromeClient;
+import android.webkit.WebSettings;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
+import android.webkit.WebResourceError;
+import android.webkit.WebResourceRequest;
+import android.webkit.SslErrorHandler;
+import android.net.http.SslError;
+import android.widget.FrameLayout;
+import android.view.ViewGroup;
+import android.view.View;
+import android.util.Log;
+import java.lang.ref.WeakReference;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import android.speech.tts.TextToSpeech;
+import java.util.Locale;
 
-# BẮT BUỘC: Cấu hình đồ họa để giảm lag GPU trên Android yếu
-from kivy.config import Config
-Config.set('graphics', 'multisamples', '0')
-Config.set('kivy', 'pause_on_minimize', '0') # CẤM KIVY NGỦ ĐÔNG KHI ẨN APP
+public class ZaloWebManager {
 
-# --- 1. HỆ THỐNG LOG PRODUCTION ---
-if platform == 'android':
-    # Sửa chữ taxi thành zauto cho khớp với buildozer.spec
-    BASE_PATH = '/data/data/org.zauto.zauto/files/'
-    from android.runnable import run_on_ui_thread
-    from jnius import autoclass, cast
-    from android.permissions import request_permissions, Permission
-    from android.broadcast import BroadcastReceiver
-    PythonActivity = autoclass('org.kivy.android.PythonActivity')
-    Settings = autoclass('android.provider.Settings')
-    Intent = autoclass('android.content.Intent')
-    FrameLayout = autoclass('android.widget.FrameLayout')
-else:
-    BASE_PATH = './'
-    def run_on_ui_thread(func): return func
+    public static WebView hiddenWebView;
+    public static FrameLayout webLayout;
+    private static final String TAG = "ZAutoWebManager";
 
-LOG_DIR = os.path.join(BASE_PATH, 'logs')
-os.makedirs(LOG_DIR, exist_ok=True)
-logging.basicConfig(
-    handlers=[RotatingFileHandler(os.path.join(LOG_DIR, 'system.log'), maxBytes=1024*1024, backupCount=3)],
-    level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+    private static Handler watchdogHandler;
+    private static Runnable watchdogRunnable;
+    public static long lastHeartbeat = System.currentTimeMillis();
 
-# --- 2. CƠ SỞ DỮ LIỆU SQLITE (THAY THẾ JSON) ---
-DB_PATH = os.path.join(BASE_PATH, 'zauto_pro.db')
-db_lock = threading.Lock()
+    private static long lastReloadTime = 0;
+    private static int reloadCountWindow = 0;
+    private static long firstReloadInWindow = 0;
 
-def init_db():
-    with db_lock:
-        try:
-            # THÊM isolation_level=None (Autocommit) để Worker không bị block "Database is locked"
-            conn = sqlite3.connect(DB_PATH, timeout=15.0, isolation_level=None)
-            c = conn.cursor()
-            c.execute('PRAGMA journal_mode=WAL;') # Chống crash khi đọc/ghi đồng thời
-            c.execute('CREATE TABLE IF NOT EXISTS config (key_name TEXT PRIMARY KEY, value_data TEXT)')
-            c.execute('CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, time REAL, group_name TEXT, msg TEXT)')
-            conn.commit()
-        except Exception as e:
-            logger.error(f"init_db error: {e}")
-        finally:
-            if 'conn' in locals() and conn: conn.close()
+    private static WeakReference<Activity> activityRef;
 
-# --- 3. LRU CACHE ANTI-DUPLICATE (CHỐNG TRÀN RAM) ---
-class LRUCache(OrderedDict):
-    def __init__(self, maxsize=1000, *args, **kwds):
-        self.maxsize = maxsize
-        super().__init__(*args, **kwds)
-    def __setitem__(self, key, value):
-        super().__setitem__(key, value)
-        if len(self) > self.maxsize:
-            oldest = next(iter(self))
-            del self[oldest]
+    private static final ConcurrentLinkedQueue<Runnable> replyQueue = new ConcurrentLinkedQueue<>();
+    private static boolean isSending = false;
 
-CONFIG_FILE = BASE_PATH + 'config.json' # Giữ biến này để không lỗi code nếu sót
-HISTORY_FILE = BASE_PATH + 'history.json'
-SUPPORT_PHONE = "0838429999"
-LICENSE_FILE = os.path.join(BASE_PATH, 'license.dat')
-TRIAL_FILE = os.path.join(BASE_PATH, 'trial_check.dat')
-def get_machine_id():
-    """
-    Kết hợp ANDROID_ID + package name rồi hash SHA256.
-    Từ Android 8+, ANDROID_ID được scope theo từng package nên ổn định hơn.
-    """
-    if platform == 'android':
-        try:
-            Secure = autoclass('android.provider.Settings$Secure')
-            content_resolver = PythonActivity.mActivity.getContentResolver()
-            android_id = Secure.getString(content_resolver, Secure.ANDROID_ID) or ""
-            pkg = PythonActivity.mActivity.getPackageName() or "org.zauto.zauto"
-            combined = f"{android_id}:{pkg}"
-            return hashlib.sha256(combined.encode()).hexdigest()[:32]
-        except: pass
-    return str(uuid.getnode())[:12]
-
-def verify_license(lic_string, machine_id):
-    """Xác thực Key dựa trên SHA256 (Logic từ keygen.py)"""
-    try:
-        if not lic_string or ":" not in lic_string: return False, 0
-        expire_ts_str, key_hash = lic_string.split(':')
-        expire_ts = int(expire_ts_str)
-        # Khớp logic băm SHA256: f"{machine_id}:{expire}"
-        raw_data = f"{machine_id}:{expire_ts}"
-        calculated_hash = hashlib.sha256(raw_data.encode()).hexdigest()[:32]
-        if calculated_hash == key_hash and expire_ts > int(time.time()):
-            return True, expire_ts
-    except: pass
-    return False, 0
-KV = '''
-<RideCard>:
-    orientation: "vertical"
-    padding: "16dp"
-    spacing: "12dp"
-    size_hint_y: None
-    height: self.minimum_height
-    adaptive_height: True
-    elevation: 0
-    radius: [15, 15, 15, 15]
-    md_bg_color: 1, 1, 1, 1
-
-    MDBoxLayout:
-        orientation: "horizontal"
-        size_hint_y: None
-        height: "40dp"
-        spacing: "15dp"
-        FitImage:
-            source: "profile.jpg"
-            size_hint: None, None
-            size: "40dp", "40dp"
-            radius: [20, ]
-        MDBoxLayout:
-            orientation: "vertical"
-            MDLabel:
-                text: root.group_text
-                font_style: "Subtitle1"
-                bold: True
-                theme_text_color: "Primary"
-                shorten: True
-                shorten_from: "right"
-            MDLabel:
-                text: "Vừa xong lúc " + root.time_text
-                font_style: "Caption"
-                theme_text_color: "Secondary"
-
-    MDSeparator:
-
-    MDLabel:
-        text: root.msg_text
-        font_style: "Body1"
-        theme_text_color: "Custom"
-        text_color: 0.15, 0.15, 0.15, 1
-        valign: "top"
-        halign: "left"
-        size_hint_y: None
-        height: self.texture_size[1]
-
-    MDBoxLayout:
-        orientation: "horizontal"
-        spacing: "10dp"
-        size_hint_y: None
-        height: "45dp"
-        MDRoundFlatButton:
-            text: "BỎ QUA"
-            size_hint_x: 0.4
-            text_color: 0.6, 0.2, 0.2, 1
-            line_color: 0.9, 0.5, 0.5, 1
-            on_release: app.remove_ride(root)
-        Button:
-            text: "NHẬN CUỐC"
-            size_hint_x: 0.6
-            size_hint_y: None
-            height: "45dp"
-            bold: True
-            background_normal: ''
-            background_color: 0.1, 0.5, 0.8, 1
-            on_release: app.manual_accept_ride(root)
-
-MDScreen:
-    md_bg_color: 0.95, 0.96, 0.98, 1
-
-    MDBottomNavigation:
-        id: bottom_nav
-        panel_color: 1, 1, 1, 1
-        text_color_active: 0.1, 0.5, 0.8, 1
-        text_color_normal: 0.6, 0.6, 0.6, 1
-        use_text: True
-
-        # ================= TAB 1: CANH ME =================
-        MDBottomNavigationItem:
-            name: 'tab_canhme'
-            text: 'Canh me'
-            icon: 'radar'
-            
-            MDBoxLayout:
-                orientation: "vertical"
-                
-                MDBoxLayout:
-                    orientation: "vertical"
-                    size_hint_y: None
-                    height: self.minimum_height
-                    adaptive_height: True
-                    padding: "15dp"
-                    spacing: "10dp"
-                    md_bg_color: 1, 1, 1, 1
-                    radius: [0, 0, 15, 15]
-                    
-                    MDBoxLayout:
-                        orientation: "horizontal"
-                        size_hint_y: None
-                        height: "40dp"
-                        
-                        MDLabel:
-                            id: lbl_radar_status
-                            text: "TẠM DỪNG"
-                            font_style: "Subtitle2"
-                            bold: True
-                            theme_text_color: "Custom"
-                            text_color: 0.6, 0.6, 0.6, 1
-                            valign: "center"
-                            
-                        MDLabel:
-                            text: "Auto:"
-                            font_style: "Caption"
-                            bold: True
-                            theme_text_color: "Primary"
-                            halign: "right"
-                            valign: "center"
-                            size_hint_x: None
-                            width: "40dp"
-                            
-                        MDSwitch:
-                            id: sw_auto_main
-                            pos_hint: {'center_y': .5}
-                            on_active: app.sync_auto_switch(self.active)
-                            
-                    MDFillRoundFlatButton:
-                        id: btn_toggle_radar
-                        text: "BẬT QUÉT CUỐC"
-                        font_name: "Roboto-Bold"
-                        size_hint_x: 1
-                        size_hint_y: None
-                        height: "45dp"
-                        md_bg_color: 0.1, 0.6, 0.2, 1
-                        on_release: app.toggle_radar()
-                
-                MDBoxLayout:
-                    size_hint_y: None
-                    height: "40dp"
-                    md_bg_color: 1, 0.95, 0.8, 1
-                    padding: ["10dp", "0dp"]
-                    MDIcon:
-                        icon: "alert-circle-outline"
-                        theme_text_color: "Custom"
-                        text_color: 0.8, 0.5, 0, 1
-                        pos_hint: {"center_y": .5}
-                    MDLabel:
-                        text: " Giữ sáng màn hình để bắt cuốc"
-                        font_style: "Caption"
-                        theme_text_color: "Custom"
-                        text_color: 0.6, 0.4, 0, 1
-                        valign: "center"
-
-                ScrollView:
-                    MDBoxLayout:
-                        id: ride_list
-                        orientation: "vertical"
-                        padding: "10dp"
-                        spacing: "10dp"
-                        size_hint_y: None
-                        height: self.minimum_height
-                        adaptive_height: True
-
-        # ================= TAB 2: LỊCH SỬ =================
-        MDBottomNavigationItem:
-            name: 'tab_tinnhan'
-            text: 'Tin nhắn'
-            icon: 'message-text-outline'
-            MDBoxLayout:
-                orientation: 'vertical'
-                MDTopAppBar:
-                    title: "Lịch sử chốt"
-                    elevation: 0
-                    md_bg_color: 1, 1, 1, 1
-                    specific_text_color: 0.1, 0.1, 0.1, 1
-                    right_action_items: [["delete-sweep-outline", lambda x: app.clear_history()]]
-                
-                MDBoxLayout:
-                    size_hint_y: None
-                    height: "60dp"
-                    padding: "10dp"
-                    md_bg_color: 1, 1, 1, 1
-                    Button:
-                        text: "MỞ KHUNG CHAT ZALO"
-                        size_hint_x: 1
-                        size_hint_y: None
-                        height: "45dp"
-                        bold: True
-                        background_normal: ''
-                        background_color: 0.1, 0.6, 0.2, 1
-                        on_release: app.root.ids.bottom_nav.switch_tab('tab_zalo')
-
-                ScrollView:
-                    MDList:
-                        id: msg_history_list
-                        md_bg_color: 0.95, 0.96, 0.98, 1
-
-        # ================= TAB NHÓM =================
-        MDBottomNavigationItem:
-            name: 'tab_nhom'
-            text: 'Nhóm'
-            icon: 'account-group'
-            
-            MDBoxLayout:
-                orientation: 'vertical'
-                
-                MDTopAppBar:
-                    title: "Danh sách nhóm"
-                    elevation: 0
-                    md_bg_color: 0.1, 0.6, 0.2, 1
-                    specific_text_color: 1, 1, 1, 1
-                    pos_hint: {"top": 1}
-                    
-                ScrollView:
-                    MDList:
-                        id: group_filter_list
-                        md_bg_color: 0.95, 0.96, 0.98, 1
-
-        # ================= TAB TÀI KHOẢN ZALO =================
-        MDBottomNavigationItem:
-            name: 'tab_zalo'
-            text: 'Zalo'
-            icon: 'account-circle'
-            on_tab_press: app._init_webview_android()
-            on_enter: app.set_webview_visible(True)
-            on_leave: app.set_webview_visible(False)
-            
-
-            MDBoxLayout:
-                orientation: 'vertical'
-
-                MDBoxLayout:
-                    id: zalo_status_bar
-                    size_hint_y: None
-                    height: "65dp"
-                    padding: ["10dp", "5dp"]
-                    spacing: "10dp"
-                    md_bg_color: 0.1, 0.5, 0.8, 1
-                    
-                    FitImage:
-                        id: zalo_avatar_view
-                        source: "profile.jpg"
-                        size_hint: None, None
-                        size: "40dp", "40dp"
-                        radius: [20, ]
-                        pos_hint: {"center_y": .5}
-
-                    # ---> ĐÃ LÙI LỀ VÀO TRONG NẰM CÙNG HÀNG VỚI FitImage <---
-                    MDBoxLayout:
-                        orientation: "vertical"
-                        pos_hint: {"center_y": .5}
-                        md_bg_color: 0.1, 0.5, 0.8, 1
-                        MDLabel:
-                            id: zalo_name_view
-                            text: "Chưa kết nối Zalo"
-                            theme_text_color: "Custom"
-                            text_color: 1, 1, 1, 1
-                            font_style: "Subtitle2"
-                            bold: True
-                        MDLabel:
-                            text: "Trình duyệt chìm"
-                            theme_text_color: "Custom"
-                            text_color: 0.9, 0.9, 0.9, 1
-                            font_style: "Caption"
-
-                    # ---> NÚT NÀY CŨNG ĐÃ LÙI LỀ VÀO TRONG <---
-                    MDRaisedButton:
-                        id: btn_zalo_action
-                        text: "1. ĐỒNG BỘ ZALO"
-                        size_hint_y: None
-                        height: "36dp"
-                        md_bg_color: 0.1, 0.6, 0.2, 1
-                        pos_hint: {"center_y": .5}
-                        elevation: 0
-                        on_release: app.sync_cookie_from_webview()
-
-                # ---> HỘP CHỨA WEBVIEW PHẢI NẰM NGOÀI ĐỂ XẾP DƯỚI THANH STATUS <---
-                MDBoxLayout:
-                    id: webview_container
-                    size_hint_y: 1
-                    md_bg_color: 1, 1, 1, 1
-
-        # ================= TAB CÀI ĐẶT =================
-        MDBottomNavigationItem:
-            name: 'tab_caidat'
-            text: 'Cài đặt'
-            icon: 'cog-outline'
-            MDBoxLayout:
-                orientation: 'vertical'
-                MDTopAppBar:
-                    title: "Thiết lập hệ thống"
-                    elevation: 0
-                    md_bg_color: 1, 1, 1, 1
-                    specific_text_color: 0.1, 0.1, 0.1, 1
-                
-                ScrollView:
-                    MDBoxLayout:
-                        orientation: 'vertical'
-                        size_hint_y: None
-                        height: self.minimum_height
-                        adaptive_height: True
-                        padding: "10dp"
-                        spacing: "15dp"
-                        md_bg_color: 0.95, 0.96, 0.98, 1
-                        
-                        MDBoxLayout: # Thông tin tài khoản
-                            orientation: "horizontal"
-                            size_hint_y: None
-                            height: "70dp"
-                            padding: "10dp"
-                            md_bg_color: 1, 1, 1, 1
-                            radius: [10, ]
-                            FitImage:
-                                source: 'profile.jpg'
-                                size_hint: None, None
-                                size: "50dp", "50dp"
-                                radius: [25, ]
-                            MDBoxLayout:
-                                orientation: 'vertical'
-                                padding: ["10dp", 0, 0, 0]
-                                MDLabel:
-                                    text: "ZAuto VIP"
-                                    font_style: "Subtitle2"
-                                    bold: True
-                                MDLabel:
-                                    text: "Hỗ trợ mua: 083.842.9999"
-                                    theme_text_color: "Primary"
-                                    font_style: "Caption"
-
-                        # --- KHỐI NÚT ĐIỀU KHIỂN HỆ THỐNG ---
-                        MDBoxLayout:
-                            orientation: "vertical"
-                            size_hint_y: None
-                            height: self.minimum_height
-                            adaptive_height: True
-                            spacing: "10dp"
-
-                            Button:
-                                text: "CẤP QUYỀN APP"
-                                size_hint_x: 1
-                                size_hint_y: None
-                                height: "45dp"
-                                bold: True
-                                background_normal: ''
-                                background_color: 0.8, 0.4, 0.1, 1
-                                on_release: app.check_permissions_and_guide()
-                                
-                            Button:
-                                text: "CHỐNG NGỦ ĐÔNG (QUAN TRỌNG)"
-                                size_hint_x: 1
-                                size_hint_y: None
-                                height: "45dp"
-                                bold: True
-                                background_normal: ''
-                                background_color: 0.6, 0.1, 0.1, 1
-                                on_release: app.request_ignore_battery()
-
-                        # --- KHỐI CÔNG TẮC (GIỌNG NÓI / AUTO / FILTER) ---
-                        MDBoxLayout:
-                            orientation: "vertical"
-                            size_hint_y: None
-                            height: self.minimum_height
-                            adaptive_height: True
-                            padding: "10dp"
-                            md_bg_color: 1, 1, 1, 1
-                            radius: [10, ]
-
-                            MDBoxLayout:
-                                size_hint_y: None
-                                height: "45dp"
-                                MDLabel:
-                                    text: "Đọc giọng nói (Báo cuốc/Chốt)"
-                                    font_style: "Subtitle2"
-                                MDSwitch:
-                                    id: sw_voice
-                                    pos_hint: {'center_y': .5}
-                            
-                            MDSeparator:
-
-                            MDBoxLayout:
-                                size_hint_y: None
-                                height: "45dp"
-                                MDLabel:
-                                    text: "Tự động chốt cuốc"
-                                    font_style: "Subtitle2"
-                                MDSwitch:
-                                    id: sw_auto_settings
-                                    pos_hint: {'center_y': .5}
-                                    on_active: app.sync_auto_switch(self.active)
-                            
-                            MDSeparator:
-
-                            MDBoxLayout:
-                                size_hint_y: None
-                                height: "45dp"
-                                MDLabel:
-                                    text: "Chỉ nhận tin chứa Từ Khóa"
-                                    font_style: "Subtitle2"
-                                MDSwitch:
-                                    id: sw_filter
-                                    pos_hint: {'center_y': .5}
-                                    on_active: app.on_filter_switch(self.active)
-                            
-                        # --- HƯỚNG DẪN DÙNG TIẾNG VIỆT ---
-                        MDBoxLayout:
-                            orientation: "vertical"
-                            size_hint_y: None
-                            height: self.minimum_height 
-                            padding: "12dp"
-                            spacing: "5dp" 
-                            md_bg_color: 0.9, 0.95, 1, 1
-                            radius: [10, ]
-                            
-                            MDLabel:
-                                text: "💡 MẸO GÕ TIẾNG VIỆT:"
-                                font_style: "Caption"
-                                bold: True
-                                theme_text_color: "Primary"
-                                size_hint_y: None
-                                height: self.texture_size[1]
-                                
-                            MDLabel:
-                                text: "Soạn chữ ở Zalo rồi Copy,bấm biểu tượng DÁN ở bên cạnh mỗi ô."
-                                font_style: "Caption"
-                                theme_text_color: "Secondary"
-                                size_hint_y: None
-                                height: self.texture_size[1]
-
-                        # --- CÁC Ô NHẬP LIỆU CÓ NÚT DÁN NHANH ---
-                        MDBoxLayout: 
-                            orientation: "vertical"
-                            size_hint_y: None
-                            height: self.minimum_height
-                            adaptive_height: True
-                            padding: "10dp"
-                            spacing: "20dp"
-                            md_bg_color: 1, 1, 1, 1
-                            radius: [10, ]
-                            
-                            MDBoxLayout:
-                                orientation: "horizontal"
-                                size_hint_y: None
-                                height: "50dp"
-                                spacing: "10dp"
-                                TextInput:
-                                    id: inp_nhan
-                                    hint_text: "Từ khóa NHẬN"
-                                    multiline: True
-                                    background_color: 0.95, 0.95, 0.95, 1
-                                    foreground_color: 0, 0, 0, 1
-                                MDIconButton:
-                                    icon: "content-paste"
-                                    pos_hint: {"center_y": .5}
-                                    on_release: inp_nhan.text = app.Clipboard.paste()
-
-                            MDBoxLayout:
-                                orientation: "horizontal"
-                                size_hint_y: None
-                                height: "50dp"
-                                spacing: "10dp"
-                                TextInput:
-                                    id: inp_loai
-                                    hint_text: "Từ khóa BỎ QUA"
-                                    multiline: True
-                                    background_color: 0.95, 0.95, 0.95, 1
-                                    foreground_color: 0, 0, 0, 1
-                                MDIconButton:
-                                    icon: "content-paste"
-                                    pos_hint: {"center_y": .5}
-                                    on_release: inp_loai.text = app.Clipboard.paste()
-
-                            MDBoxLayout:
-                                orientation: "horizontal"
-                                size_hint_y: None
-                                height: "50dp"
-                                spacing: "10dp"
-                                TextInput:
-                                    id: inp_reply
-                                    hint_text: "Nội dung trả lời tự động"
-                                    multiline: True
-                                    background_color: 0.95, 0.95, 0.95, 1
-                                    foreground_color: 0, 0, 0, 1
-                                MDIconButton:
-                                    icon: "content-paste"
-                                    pos_hint: {"center_y": .5}
-                                    on_release: inp_reply.text = app.Clipboard.paste()
-                                
-                            # ✅ BỔ SUNG Ô NHẬP API KEY OCR TẠI ĐÂY
-                            MDBoxLayout:
-                                orientation: "horizontal"
-                                size_hint_y: None
-                                height: "50dp"
-                                spacing: "10dp"
-                                TextInput:
-                                    id: inp_ocr_key
-                                    hint_text: "Mã API Key OCR (Đọc ảnh)"
-                                    multiline: False
-                                    background_color: 0.9, 1, 0.9, 1  # Đổi nhẹ màu xanh cho nổi bật
-                                    foreground_color: 0, 0, 0, 1
-                                MDIconButton:
-                                    icon: "content-paste"
-                                    pos_hint: {"center_y": .5}
-                                    on_release: inp_ocr_key.text = app.Clipboard.paste()
-
-                            TextInput:
-                                id: inp_delay
-                                hint_text: "Khoảng cách chốt 2 cuốc (giây)"
-                                text: "30"
-                                input_filter: "int"
-                                size_hint_y: None
-                                height: "45dp"
-                                background_color: 0.95, 0.95, 0.95, 1
-                                foreground_color: 0, 0, 0, 1
-                        
-                        Button:
-                            text: "LƯU CẤU HÌNH"
-                            size_hint_x: 1
-                            size_hint_y: None
-                            height: "45dp"
-                            bold: True
-                            background_normal: ''
-                            background_color: 0.1, 0.5, 0.8, 1
-                            on_release: app.save_config()
-
-                        # ✅ BỔ SUNG NÚT HƯỚNG DẪN Ở ĐÂY
-                        Button:
-                            text: "📖 HƯỚNG DẪN SỬ DỤNG & LẤY MÃ OCR"
-                            size_hint_x: 1
-                            size_hint_y: None
-                            height: "45dp"
-                            bold: True
-                            background_normal: ''
-                            background_color: 0.8, 0.4, 0.1, 1
-                            on_release: app.show_guide_popup()
-
-                        MDBoxLayout:
-                            orientation: "vertical"
-                            size_hint_y: None
-                            height: "180dp"
-                            padding: "15dp"
-                            spacing: "5dp"
-                            md_bg_color: 1, 1, 1, 1
-                            radius: [10, ]
-                            MDLabel:
-                                text: "BẢN QUYỀN"
-                                bold: True
-                                font_style: "Subtitle2"
-                            MDSeparator:
-                            MDLabel:
-                                id: lbl_key_type
-                                text: "Loại Key: Đang kiểm tra..."
-                                font_style: "Caption"
-                            MDLabel:
-                                id: lbl_expiry
-                                text: "Hết hạn: --/--/----"
-                                font_style: "Caption"
-                            MDLabel:
-                                text: "SĐT Mua Key: 0838429999"
-                                theme_text_color: "Custom"
-                                text_color: 0.1, 0.5, 0.8, 1
-                                font_style: "Caption"
-                            Button:
-                                text: "MUA THÊM HẠN"
-                                size_hint_y: None
-                                height: "35dp"
-                                pos_hint: {"center_x": .5}
-                                bold: True
-                                background_normal: ''
-                                background_color: 0.1, 0.6, 0.2, 1
-                                on_release: app.show_activation_popup_from_settings()
-
-                            Button:
-                                text: "🛠 KIỂM TRA LỖI HỆ THỐNG"
-                                size_hint_y: None
-                                height: "35dp"
-                                pos_hint: {"center_x": .5}
-                                bold: True
-                                background_normal: ''
-                                background_color: 0.4, 0.4, 0.4, 1
-                                on_release: app.show_system_debug()
-
-                        MDBoxLayout:
-                            size_hint_y: None
-                            height: "20dp"
-                            md_bg_color: 0.95, 0.96, 0.98, 1
-'''
-
-class ActivationPopup(Popup):
-    def __init__(self, machine_id, on_success, can_cancel=False, **kwargs):
-        super().__init__(**kwargs)
-        self.title = "KÍCH HOẠT BẢN QUYỀN ZAUTO VIP"
-        
-        # --- CẤU HÌNH KÍCH THƯỚC THỦ CÔNG (CHỐNG LỆM NÚT) ---
-        self.size_hint = (0.9, None) # Rộng 90% màn hình, cao không theo tỷ lệ %
-        self.height = dp(480)        # Chiều cao cố định 480dp (vừa đủ hiện tất cả)
-        self.auto_dismiss = can_cancel 
-        self.on_success = on_success
-        self.machine_id = machine_id
-
-        # --- THIẾT KẾ NỀN TRẮNG CHUẨN VIP ---
-        self.background = ""  
-        self.background_color = (1, 1, 1, 1) 
-        self.title_color = (0, 0, 0, 1)      
-        self.separator_color = (0.1, 0.5, 0.8, 1)
-
-        # --- TẠO BỘ CUỘN (SCROLLVIEW) ---
-        # Giúp máy màn hình ngắn vẫn vuốt xuống để thấy nút Kích Hoạt
-        root_scroll = ScrollView(size_hint=(1, 1), do_scroll_x=False)
-
-        # Layout chứa toàn bộ nội dung bên trong ScrollView
-        main_layout = BoxLayout(orientation='vertical', padding=dp(15), spacing=dp(12), size_hint_y=None)
-        # Quan trọng: Dòng này giúp layout tự nở dài ra theo nội dung để ScrollView hoạt động
-        main_layout.bind(minimum_height=main_layout.setter('height'))
-
-        # --- 1. NÚT X MÀU ĐỎ (CHỈ HIỆN KHI can_cancel=True) ---
-        if can_cancel:
-            header = BoxLayout(size_hint_y=None, height=dp(30))
-            header.add_widget(Label()) # Đẩy nút X sang phải
-            btn_close = Button(
-                text="X", size_hint=(None, None), size=(dp(40), dp(30)),
-                bold=True, color=(1, 1, 1, 1), background_normal='',
-                background_color=(0.8, 0, 0, 1)
-            )
-            btn_close.bind(on_release=self.dismiss)
-            header.add_widget(btn_close)
-            main_layout.add_widget(header)
-
-        # --- 2. PHẦN COPY ID MÁY ---
-        main_layout.add_widget(Label(
-            text="MÃ ID MÁY CỦA BẠN:", 
-            color=(0.3, 0.3, 0.3, 1), font_size='14sp', 
-            size_hint_y=None, height=dp(20), bold=True
-        ))
-
-        self.id_box = TextInput(
-            text=machine_id, readonly=True, size_hint_y=None, height=dp(45),
-            halign='center', font_size='16sp', font_name="Roboto",
-            background_color=(0.95, 0.95, 0.95, 1), foreground_color=(0, 0, 0, 1)
-        )
-        main_layout.add_widget(self.id_box)
-
-        btn_copy = Button(
-            text="CHẠM ĐỂ COPY ID MÁY", 
-            size_hint_y=None, height=dp(45),
-            bold=True, font_size='15sp', background_normal='',
-            background_color=(0.1, 0.5, 0.8, 1)
-        )
-        btn_copy.bind(on_release=self.copy_to_clipboard)
-        main_layout.add_widget(btn_copy)
-        
-        # --- 3. PHẦN CHỌN GÓI VÀ NHẬP KEY ---
-        main_layout.add_widget(Label(
-            text="CHỌN GÓI VÀ NHẬP MÃ KEY:", 
-            color=(0.2, 0.2, 0.2, 1), font_size='14sp',
-            size_hint_y=None, height=dp(20), bold=True
-        ))
-        
-        self.pkg_spin = Spinner(
-            text='Chọn gói mua',
-            values=('30 Ngày - 30K', '365 Ngày - 300K', 'VĨNH VIỄN - 600K'),
-            size_hint_y=None, height=dp(45),
-            background_color=(0.1, 0.5, 0.8, 1), color=(1, 1, 1, 1)
-        )
-        main_layout.add_widget(self.pkg_spin)
-
-        self.key_in = TextInput(
-            hint_text="Dán mã Key đã mua vào đây...", 
-            multiline=False, size_hint_y=None, height=dp(45),
-            halign='center', font_size='15sp'
-        )
-        main_layout.add_widget(self.key_in)
-
-        # --- 4. THÔNG TIN HỖ TRỢ ---
-        main_layout.add_widget(Label(
-            text=f"Liên hệ Zalo mua Key: {SUPPORT_PHONE}", 
-            font_size='13sp', color=(0.8, 0.2, 0.2, 1),
-            size_hint_y=None, height=dp(30)
-        ))
-
-        # --- 5. NÚT KÍCH HOẠT ---
-        btn_active = Button(
-            text="KÍCH HOẠT NGAY", 
-            size_hint_y=None, height=dp(55), 
-            background_normal='', background_color=(0, 0.5, 0, 1), 
-            color=(1, 1, 1, 1), bold=True
-        )
-        btn_active.bind(on_release=self.validate)
-        main_layout.add_widget(btn_active)
-
-        # Gán layout vào ScrollView, gán ScrollView làm nội dung của Popup
-        root_scroll.add_widget(main_layout)
-        self.content = root_scroll
-
-    def copy_to_clipboard(self, instance):
-        """Thực hiện copy ID vào clipboard"""
-        from kivy.core.clipboard import Clipboard
-        Clipboard.copy(self.machine_id)
-        toast("Đã copy ID máy thành công!")
-
-    def validate(self, instance):
-        key = self.key_in.text.strip()
-        ok, expiry = verify_license(key, self.machine_id)
-        if ok:
-            with open(LICENSE_FILE, 'w') as f: f.write(key)
-            self.on_success(expiry)
-            self.dismiss()
-        else:
-            toast("Mã Key không đúng hoặc đã hết hạn!")
-class RideCard(MDCard):
-    group_text = StringProperty()
-    msg_text = StringProperty()
-    time_text = StringProperty()
-
-class ZAutoProApp(MDApp):
-    # ==========================================
-    # QUẢN LÝ PHIÊN BẢN (TĂNG SỐ NÀY LÊN MỖI LẦN BUILD MỚI)
-    APP_VERSION = 4.6
-    
-    # LINK TRẠM PHÁT SÓNG GITHUB GIST CỦA BẠN
-    UPDATE_URL = "https://gist.githubusercontent.com/thienne3110/201422dc482a5ba8e519cad25aeb8918/raw/update.json"
-    # ==========================================
-
-    def toggle_radar(self):
-        """Hàm bật/tắt công tắc Radar (Chỉ quét, không quyết định Auto)"""
-        self.is_radar_running = not self.is_radar_running
-        
-        btn = self.root.ids.btn_toggle_radar
-        lbl = self.root.ids.lbl_radar_status
-        
-        if self.is_radar_running:
-            btn.text = "ĐANG QUÉT... (BẤM ĐỂ DỪNG)"
-            btn.md_bg_color = (0.8, 0.2, 0.2, 1) # Nút chuyển Đỏ
-            lbl.text = "RADAR ĐANG HOẠT ĐỘNG"
-            lbl.text_color = (0.1, 0.5, 0.8, 1) # Chữ chuyển Xanh dương
-            toast("Radar đã BẬT: Đang lắng nghe cuốc xe!")
-        else:
-            btn.text = "BẬT RADAR QUÉT CUỐC"
-            btn.md_bg_color = (0.1, 0.6, 0.2, 1)
-            lbl.text = "HỆ THỐNG ĐANG TẠM DỪNG"
-            lbl.text_color = (0.6, 0.6, 0.6, 1)
-            toast("Radar đã TẠM DỪNG!")
-
-    def sync_auto_switch(self, active_state):
-        try:
-            if self.root.ids.sw_auto_main.active != active_state:
-                self.root.ids.sw_auto_main.active = active_state
-
-            if self.root.ids.sw_auto_settings.active != active_state:
-                self.root.ids.sw_auto_settings.active = active_state
-
-            # FIX 1: BẮT BUỘC PHẢI CẬP NHẬT VÀO BỘ NHỚ RAM TRƯỚC KHI LƯU
-            self.config_data['sw_auto'] = active_state
-            self.save_config_silent()
-
-            toast("Đã bật AUTO CHỐT" if active_state else "Đã tắt AUTO CHỐT")
-
-        except Exception:
-            print(traceback.format_exc())
-    def on_filter_switch(self, active_state):
-        self.config_data['sw_filter'] = active_state
-        self.save_config_silent()
-        toast("Đã BẬT lọc từ khóa" if active_state else "Đã TẮT lọc từ khóa - Nhận mọi tin")        
-    def build(self):
-        from kivy.core.clipboard import Clipboard # Thêm dòng này
-        self.Clipboard = Clipboard
-        self.icon = 'profile.jpg'
-        self.theme_cls.primary_palette = "Blue"
-        self.config_data = {
-            'nhan': '', 'loai': '', 'reply_msg': 'Ok nhận', 'gia_km': '12000',
-            'global_delay': '30', 'sw_voice': True, # Thêm sw_voice vào đây
-            'sw_filter': False, 'sw_auto': False, 'is_linked': False
+    // =========================================================
+    // ỐNG DẪN RAM SIÊU TỐC (BYPASS ANDROID 14 BROADCAST BAN)
+    // =========================================================
+    public static final ConcurrentLinkedQueue<String> pythonMsgQueue = new ConcurrentLinkedQueue<>();
+    public static TextToSpeech tts;
+	// =========================================================
+    // HÀM ÉP TỈNH NGỦ TỪ PYTHON GỌI XUỐNG
+    // =========================================================
+    public static void forceWakeup() {
+        safeEvaluateJs(
+            "try { " +
+            "   if(window.scanConvItem) { document.querySelectorAll('.msg-item').forEach(window.scanConvItem); } " +
+            "   document.body.dispatchEvent(new MouseEvent('mousemove', {bubbles:true, clientX: 100, clientY: 100}));" +
+            "} catch(e) {}"
+        );
+    }
+    // =========================================================
+    // REPLY QUEUE
+    // =========================================================
+    private static void processReplyQueue() {
+        if (isSending || replyQueue.isEmpty()) return;
+        isSending = true;
+        Runnable task = replyQueue.poll();
+        if (task != null) {
+            task.run();
+            new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                isSending = false;
+                processReplyQueue();
+            }, 2500);
+        } else {
+            isSending = false;
         }
-        self.last_global_reply_time = 0 # Thêm dòng này để theo dõi thời gian chốt cuối cùng
-        self.is_linked = False # Khai báo mặc định là chưa liên kết
-        self.root = Builder.load_string(KV)
-        
-        return self.root
-
-    def on_start(self):
-        init_db()
-        self.load_config()
-        self.check_license_at_startup()
-        self.check_for_update()
-
-        if platform == 'android':
-            import subprocess
-            from jnius import autoclass
-            PythonActivity = autoclass('org.kivy.android.PythonActivity')
-
-            # ==========================================
-            # 1. KÍCH HOẠT NODE.JS BACKEND (CHẠY THẲNG libnode.so)
-            # ==========================================
-            try:
-                app_info = PythonActivity.mActivity.getApplicationInfo()
-                native_lib_dir = app_info.nativeLibraryDir
-                files_dir = PythonActivity.mActivity.getFilesDir().getAbsolutePath()
-
-                # ✅ CHẠY THẲNG libnode.so từ nativeLibraryDir — không copy, không chmod
-                node_bin_path = os.path.join(native_lib_dir, 'libnode.so')
-
-                # Đường dẫn server.js
-                app_dir = os.path.join(
-                    os.getenv('ANDROID_PRIVATE', '/data/data/org.zauto.zauto/files'),
-                    'app'
-                )
-                server_js_path = os.path.join(app_dir, 'nodejs_backend', 'server.js')
-                backend_dir = os.path.join(app_dir, 'nodejs_backend')
-
-                if not os.path.exists(node_bin_path):
-                    self.node_start_error = f"Không tìm thấy libnode.so tại {node_bin_path}"
-                    logger.error(f"❌ {self.node_start_error}")
-                elif not os.path.exists(server_js_path):
-                    self.node_start_error = f"Không tìm thấy server.js tại {server_js_path}"
-                    logger.error(f"❌ {self.node_start_error}")
-                else:
-                    logger.info(f"✅ libnode.so: {node_bin_path}")
-                    logger.info(f"✅ server.js: {server_js_path}")
-
-                    # Biến môi trường cho Node.js
-                    node_env = os.environ.copy()
-                    node_env['HOME'] = files_dir
-                    node_env['NODE_PATH'] = os.path.join(backend_dir, 'node_modules')
-
-                    # ✅ CHẠY THẲNG — không copy, không chmod
-                    self.node_process = subprocess.Popen(
-                        [node_bin_path, server_js_path],
-                        cwd=backend_dir,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        env=node_env
-                    )
-                    logger.info(f"✅ Node.js khởi chạy thành công! PID={self.node_process.pid}")
-
-                    # Luồng đọc log Node.js
-                    def _read_node_stderr():
-                        for line in self.node_process.stderr:
-                            try: logger.error(f"[NODE ERR] {line.decode('utf-8', errors='ignore').strip()}")
-                            except: pass
-
-                    def _read_node_stdout():
-                        for line in self.node_process.stdout:
-                            try: logger.info(f"[NODE] {line.decode('utf-8', errors='ignore').strip()}")
-                            except: pass
-
-                    threading.Thread(target=_read_node_stderr, daemon=True).start()
-                    threading.Thread(target=_read_node_stdout, daemon=True).start()
-
-            except Exception as e:
-                self.node_start_error = str(e)
-                logger.error(f"❌ Lỗi khởi chạy Node.js: {traceback.format_exc()}")
-
-            # ==========================================
-            # 2. CẤU HÌNH HỆ THỐNG ANDROID (CHỐNG NGỦ ĐÔNG & QUYỀN)
-            # ==========================================
-            try:
-                # KHÓA MÀN HÌNH DỌC - CHỐNG XOAY NGANG
-                ActivityInfo = autoclass('android.content.pm.ActivityInfo')
-                PythonActivity.mActivity.setRequestedOrientation(
-                    ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-                )
-
-                # ÉP CPU KHÔNG NGỦ (MỨC 1)
-                PowerManager = autoclass('android.os.PowerManager')
-                Context = autoclass('android.content.Context')
-                pm = cast(PowerManager, PythonActivity.mActivity.getSystemService(Context.POWER_SERVICE))
-                self.wakelock = pm.newWakeLock(1, "ZAuto::WakeLockCore")
-                if not self.wakelock.isHeld():
-                    self.wakelock.acquire()
-
-                # ÉP WIFI KHÔNG ĐƯỢC NGẮT (MỨC 3 - HIGH PERFORMANCE)
-                WifiManager = autoclass('android.net.wifi.WifiManager')
-                wm = cast(WifiManager, PythonActivity.mActivity.getApplicationContext().getSystemService(Context.WIFI_SERVICE))
-                self.wifilock = wm.createWifiLock(3, "ZAuto::WifiLockCore")
-                if not self.wifilock.isHeld():
-                    self.wifilock.acquire()
-
-            except Exception as e:
-                logger.error(f"Lỗi on_start cấu hình Android: {traceback.format_exc()}")
-
-        # ==========================================
-        # 3. KHỞI TẠO KIẾN TRÚC REALTIME VÀ WORKER
-        # ==========================================
-        self.processed_msg_hashes = LRUCache(maxsize=1000)
-        self.global_last_reply = 0
-        self.last_reply_time = LRUCache(maxsize=200)
-
-        self.msg_worker_thread = threading.Thread(target=self._message_worker, daemon=True)
-        self.msg_worker_thread.start()
-
-        self.reply_worker_thread = threading.Thread(target=self._reply_worker_loop, daemon=True)
-        self.reply_worker_thread.start()
-
-        self.audio_worker_thread = threading.Thread(target=self._audio_worker_loop, daemon=True)
-        self.audio_worker_thread.start()
-
-        self.poll_worker_thread = threading.Thread(target=self._nodejs_poll_worker, daemon=True)
-        self.poll_worker_thread.start()
-
-        Clock.schedule_interval(self._system_watchdog, 180)
-        Clock.schedule_interval(self._process_ui_queue, 0.1)
-    def update_group_list_ui(self, groups):
-        """Cập nhật danh sách nhóm kèm Avatar từ Zalo Web"""
-        try:
-            group_list_widget = self.root.ids.group_filter_list
-            current_ui_groups = [item.text for item in group_list_widget.children if hasattr(item, 'text')]
-            
-            # Đổi từ IconLeftWidget sang ImageLeftWidget để hiện ảnh
-            from kivymd.uix.list import OneLineAvatarIconListItem, ImageLeftWidget
-            from kivymd.uix.selectioncontrol import MDSwitch
-
-            for g in groups:
-                # Code này hỗ trợ đọc cả chuỗi (bản cũ) và Dictionary (bản mới có link avatar)
-                if isinstance(g, dict):
-                    g_name = g.get('name', 'Nhóm không tên')
-                    g_avatar = g.get('avatar', 'profile.jpg')
-                else:
-                    g_name = str(g)
-                    g_avatar = 'profile.jpg' # Ảnh mặc định nếu Node.js chưa kịp gửi link
-                
-                # Nếu nhóm chưa có trong UI thì thêm vào
-                if g_name not in current_ui_groups:
-                    if g_name not in self.enabled_groups:
-                        self.enabled_groups[g_name] = False
-                    
-                    # Dùng OneLineAvatarIconListItem thay vì OneLineIconListItem
-                    item = OneLineAvatarIconListItem(text=g_name)
-                    
-                    # ✅ NHÉT AVATAR TỪ LINK VÀO BÊN TRÁI 
-                    avatar_widget = ImageLeftWidget(
-                        source=g_avatar, 
-                        radius=[20, ]
-                    )
-                    item.add_widget(avatar_widget)
-                    
-                    # Công tắc bên phải
-                    switcher = MDSwitch(
-                        active=self.enabled_groups[g_name],
-                        pos_hint={'center_x': .9, 'center_y': .5}
-                    )
-                    switcher.bind(active=lambda sw, val, name=g_name: self.toggle_group(name, val))
-                    
-                    item.add_widget(switcher)
-                    group_list_widget.add_widget(item)
-        except Exception as e:
-            print(f"Lỗi update_group_list_ui: {e}")
-
-    def toggle_group(self, name, status):
-        """Lưu trạng thái bật/tắt của từng nhóm và thông báo"""
-        self.enabled_groups[name] = status
-        self.save_config_silent() # Lưu ngay vào file config.json
-        
-        status_text = "BẬT" if status else "TẮT"
-        toast(f"{status_text} nhận cuốc nhóm: {name}")            
-    def check_license_at_startup(self):
-        m_id = get_machine_id()
-        current_time = int(time.time())
-
-        # 1. KIỂM TRA BẢN QUYỀN CHÍNH THỨC (KEY VIP) TRƯỚC
-        if os.path.exists(LICENSE_FILE):
-            try:
-                with open(LICENSE_FILE, 'r') as f:
-                    key = f.read().strip()
-                ok, expiry = verify_license(key, m_id)
-                if ok:
-                    if expiry < current_time:
-                        self.safe_toast("Phát hiện thời gian hệ thống không chính xác!")
-                        self.show_activation_popup()
-                        return
-                    self.apply_license_ui(expiry)
-                    return
-            except Exception as e:
-                logger.error(f"Lỗi đọc license VIP: {e}")
-
-        # 2. CƠ CHẾ OFFLINE CHỐNG GỠ APP & XÓA DATA ĐỂ RESET 15 NGÀY FREE
-        trial_expire = 0
-
-        # Đường dẫn file backup ẩn ở phân vùng dùng chung (Không bị xóa khi gỡ cài đặt app)
-        backup_dir = "/sdcard/Android/media/org.zauto.taxi/"
-        backup_file = os.path.join(backup_dir, ".sys_secure_node.dat")
-
-        # Đọc dữ liệu dùng thử từ 3 nguồn để đối chiếu chéo (Local App, SharedPreferences, Backup SDCard)
-        local_val = None
-        shared_val = None
-        backup_val = None
-
-        # Nguồn A: Đọc file local của App (Bị xóa khi Clear Data hoặc Gỡ cài đặt)
-        if os.path.exists(TRIAL_FILE):
-            try:
-                with open(TRIAL_FILE, 'r') as f:
-                    local_val = self._decrypt_secure_data(f.read().strip(), m_id)
-            except: pass
-
-        # Nguồn B: Đọc SharedPreferences hệ thống (Bị xóa khi Gỡ cài đặt nhưng GIỮ LẠI khi Clear Data)
-        if platform == 'android':
-            try:
-                context = PythonActivity.mActivity
-                shared_pref = context.getSharedPreferences("ZAutoSecureStore", context.MODE_PRIVATE)
-                cipher_shared = shared_pref.getString("secure_token", None)
-                if cipher_shared:
-                    shared_val = self._decrypt_secure_data(cipher_shared, m_id)
-            except: pass
-
-        # Nguồn C: SharedPreferences thứ 2 với tên package khác (không bị xóa khi gỡ app trên Android < 9)
-        # Dùng MODE_PRIVATE với key khác để tách biệt hoàn toàn
-        if platform == 'android':
-            try:
-                context = PythonActivity.mActivity
-                shared_pref2 = context.getSharedPreferences("ZAutoBackupNode", context.MODE_PRIVATE)
-                cipher_backup = shared_pref2.getString("bk_token", None)
-                if cipher_backup:
-                    backup_val = self._decrypt_secure_data(cipher_backup, m_id)
-            except: pass
-
-        # --- LOGIC QUYẾT ĐỊNH ĐỒNG BỘ OFFLINE ---
-        # Ưu tiên lấy mốc hết hạn dùng thử nhỏ nhất/cũ nhất từng được lưu để chặn đứng hành vi gia hạn lậu
-        valid_trials = []
-        for val in [local_val, shared_val, backup_val]:
-            if val:
-                try:
-                    ts = int(val.strip())
-                    if ts > 0:
-                        valid_trials.append(ts)
-                except (ValueError, TypeError):
-                    pass
-
-        if valid_trials:
-            # Phát hiện đã từng cài app hoặc từng dùng thử: Lấy mốc thời gian dùng thử cũ nhất (an toàn nhất)
-            trial_expire = min(valid_trials)
-        else:
-            # Máy hoàn toàn sạch sẽ (Lần đầu tiên cài app thật sự)
-            trial_expire = current_time + (15 * 24 * 3600) # Cấp 15 ngày dùng thử
-
-        # ĐỒNG BỘ NGƯỢC LẠI CẢ 3 NƠI ĐỂ KHÓA CHẶT THIẾT BỊ
-        cipher_value = self._encrypt_secure_data(str(trial_expire), m_id)
-        
-        # Đồng bộ Nguồn A
-        try:
-            with open(TRIAL_FILE, 'w') as f:
-                f.write(cipher_value)
-        except: pass
-
-        # Đồng bộ Nguồn B
-        if platform == 'android':
-            try:
-                context = PythonActivity.mActivity
-                shared_pref = context.getSharedPreferences("ZAutoSecureStore", context.MODE_PRIVATE)
-                editor = shared_pref.edit()
-                editor.putString("secure_token", cipher_value)
-                editor.commit()
-            except: pass
-
-        # Đồng bộ Nguồn C (SharedPreferences backup)
-        if platform == 'android':
-            try:
-                context = PythonActivity.mActivity
-                shared_pref2 = context.getSharedPreferences("ZAutoBackupNode", context.MODE_PRIVATE)
-                editor2 = shared_pref2.edit()
-                editor2.putString("bk_token", cipher_value)
-                editor2.commit()
-            except: pass
-
-        # 3. CHỐNG QUAY NGƯỢC THỜI GIAN ĐIỆN THOẠI (TIME-TRAVEL PROTECTION)
-        last_runtime = self.config_data.get('last_runtime', 0)
-        if current_time < last_runtime:
-            self.safe_toast("Phát hiện gian lận đổi ngày giờ điện thoại! Thiết bị đã bị khóa.")
-            self.show_activation_popup()
-            return
-            
-        # Cập nhật mốc thời gian chạy app mới nhất
-        self.config_data['last_runtime'] = current_time
-        self.save_config_silent()
-
-        # 4. KIỂM TRA HẠN DÙNG THỬ
-        if trial_expire > current_time:
-            self.apply_license_ui(trial_expire, is_trial=True)
-        else:
-            self.show_activation_popup()
-    def _encrypt_secure_data(self, data, key):
-        """Mã hóa chuỗi dữ liệu dựa trên mã ANDROID_ID duy nhất của phần cứng"""
-        try:
-            # Sử dụng SHA256 của key phần cứng làm mật mã XOR
-            key_hash = hashlib.sha256(key.encode()).hexdigest()
-            encrypted = []
-            for i in range(len(data)):
-                key_c = key_hash[i % len(key_hash)]
-                enc_c = chr(ord(data[i]) ^ ord(key_c))
-                encrypted.append(enc_c)
-            # Chuyển sang dạng Hex an toàn để ghi file
-            return "".join(encrypted).encode('utf-8').hex()
-        except:
-            return data
-
-    def _decrypt_secure_data(self, hex_data, key):
-        """Giải mã chuỗi dữ liệu phần cứng"""
-        try:
-            data = bytes.fromhex(hex_data).decode('utf-8')
-            key_hash = hashlib.sha256(key.encode()).hexdigest()
-            decrypted = []
-            for i in range(len(data)):
-                key_c = key_hash[i % len(key_hash)]
-                dec_c = chr(ord(data[i]) ^ ord(key_c))
-                decrypted.append(dec_c)
-            return "".join(decrypted)
-        except:
-            return ""  # ← FIX: thụt lề chuẩn, trả về rỗng khi lỗi  
-
-    def apply_license_ui(self, expiry, is_trial=False):
-        if expiry > 4000000000:
-            type_str, date_str = "VĨNH VIỄN (VIP)", "Không giới hạn"
-        else:
-            type_str = "DÙNG THỬ (FREE)" if is_trial else "TRẢ PHÍ"
-            date_str = time.strftime('%d/%m/%Y', time.localtime(expiry))
-        
-        # Cập nhật thông tin vào Tab Cài đặt
-        self.root.ids.lbl_key_type.text = f"Loại Key: {type_str}"
-        self.root.ids.lbl_expiry.text = f"Hết hạn: {date_str}"
-
-    def show_activation_popup(self):
-        # Sửa self.m_id thành get_machine_id()
-        popup = ActivationPopup(machine_id=get_machine_id(), on_success=self.apply_license_ui, can_cancel=False)
-        popup.open()
-    def show_activation_popup_from_settings(self):
-        # Sửa self.m_id thành get_machine_id()
-        popup = ActivationPopup(machine_id=get_machine_id(), on_success=self.apply_license_ui, can_cancel=True)
-        popup.open()
-    def _message_worker(self):
-        while getattr(self, 'app_running', True):
-            try:
-                action, data = self.msg_queue.get(timeout=1.0)
-                if action == 'WEB_NEW_MSG':
-                    self._process_heavy_message(data)
-                self.msg_queue.task_done()
-            except queue.Empty:
-                continue
-            except Exception as e:
-                logger.error(f"Message Worker Crash: {traceback.format_exc()}")
-                time.sleep(1) # Chống CPU Spike khi lỗi liên tục
-
-    def _reply_worker_loop(self):
-        while getattr(self, 'app_running', True):
-            try:
-                reply_payload = self.reply_queue.get(timeout=1.0)
-                with self.reply_lock:
-                    self._execute_reply_safe(reply_payload)
-                self.reply_queue.task_done()
-                time.sleep(0.5)
-            except queue.Empty:
-                continue
-            except Exception as e:
-                logger.error(f"Reply Worker Crash: {traceback.format_exc()}")
-                time.sleep(1)
-    def _audio_worker_loop(self):
-        """Worker tuần tự: Đọc TTS thông báo nhóm → Play tin thoại → Chờ → Tin tiếp theo.
-        Mỗi tin chỉ phát 1 lần. Nhiều nhóm/nhiều tin xếp hàng lần lượt không chèn nhau.
-        """
-        # Đổi set() thành dict() để lưu kèm thời gian nhận tin
-        if not hasattr(self, 'audio_seen_dict'):
-            self.audio_seen_dict = {}
-            
-        CACHE_TTL = 3600  # Thời gian sống của tin nhắn thoại trong RAM (3600 giây = 1 tiếng)
-
-        while getattr(self, 'app_running', True):
-            try:
-                current_ts = time.time()
-                
-                # BƯỚC DỌN RÁC (GARBAGE COLLECTION): Chỉ xóa các tin đã quá 1 tiếng
-                keys_to_delete = [k for k, ts in self.audio_seen_dict.items() if current_ts - ts > CACHE_TTL]
-                for k in keys_to_delete:
-                    del self.audio_seen_dict[k]
-
-                # Nhận đủ 5 tham số; tương thích ngược với tuple 4 phần tử cũ
-                item = self.audio_queue.get(timeout=1.0)
-                if len(item) == 5:
-                    conv_id, msg_id, cache_key, duration, tts_text = item
-                else:
-                    conv_id, msg_id, cache_key, duration = item
-                    tts_text = ""
-
-                # Tạo khóa duy nhất chống phát lại (Chính xác đến từng giây)
-                if not msg_id or len(msg_id) < 4 or msg_id.startswith("TIME_") or msg_id.startswith("VOICE_"):
-                    from datetime import datetime
-                    time_str = datetime.now().strftime("%d%m%Y_%H%M%S")
-                    audio_unique_key = f"VOICE_{conv_id}_{time_str}"
-                else:
-                    audio_unique_key = f"{conv_id}_{msg_id}"
-
-                if audio_unique_key in self.audio_seen_dict:
-                    self.audio_queue.task_done()
-                    continue  # Đã phát rồi, bỏ qua
-
-                # Đánh dấu ngay trước khi phát và ghi lại mốc thời gian
-                self.audio_seen_dict[audio_unique_key] = current_ts
-
-                if platform == 'android' and tts_text:
-                    try:
-                        from jnius import autoclass as _ac
-                        _ac('org.zauto.ZaloWebManager').speak(tts_text)
-                        logger.info(f"Đã đọc TTS: {tts_text}")
-                        time.sleep(3.0)  # Chờ TTS đọc xong ~3 giây
-                    except Exception as e:
-                        logger.error(f"Lỗi TTS ZWM: {e}")
-
-                # Chờ đúng thời lượng tin thoại trước khi phát tin tiếp
-                try:
-                    wait_time = max(int(duration) + 2.0, 7.0) if int(duration) > 0 else 7.0
-                except:
-                    wait_time = 7.0
-                time.sleep(wait_time)
-
-                self.audio_queue.task_done()
-
-            except queue.Empty:
-                continue
-            except Exception as e:
-                logger.error(f"Audio Worker Crash: {traceback.format_exc()}")
-                time.sleep(1)
-    def _process_heavy_message(self, data):
-        group = data.get('group', '')
-        msg = data.get('msg', '')
-        msg_id = data.get('msg_id', '')
-        conversation_id = data.get('conversation_id', '')
-
-        if not getattr(self, 'is_radar_running', False): return
-        if not getattr(self, 'enabled_groups', {}).get(group, False): 
-            return
-
-        msg_clean = msg.strip()
-        msg_low = msg_clean.lower()
-        
-        # Tách tên người gửi
-        msg_content_only = msg_low
-        if ": " in msg_content_only:
-            msg_content_only = msg_content_only.split(": ", 1)[1]
-
-        raw_reply = self.config_data.get('reply_msg', 'Ok nhận')
-        replies = [r.strip().lower() for r in raw_reply.split(',') if r.strip()]
-        
-        # Bỏ qua tin do app tự trả lời
-        if msg_content_only in replies or any(r in msg_content_only for r in replies):
-            return 
-
-        is_voice = (
-            "tin nhắn thoại" in msg_low or "audio" in msg_low or 
-            "giọng nói" in msg_low or "âm thanh" in msg_low or 
-            "voice" in msg_low or "[tin nhắn thoại]" in msg_low
-        )
-        current_time = time.time()
-        sw_filter_active = self.config_data.get('sw_filter', False)
-
-        # ==============================================================
-        # 3. CHỐNG SPAM TIN TRÙNG - CHỈ ÁP DỤNG CHO TIN TEXT, KHÔNG CHẶN VOICE
-        # ==============================================================
-        if not hasattr(self, 'last_msg_per_group'):
-            self.last_msg_per_group = {}
-
-        msg_hash = hashlib.md5(msg_clean.encode('utf-8')).hexdigest()[:12]
-
-        # Chỉ kiểm tra trùng lặp cho tin TEXT - voice không áp dụng
-        if not is_voice:
-            if conversation_id in self.last_msg_per_group:
-                last_id, last_hash, last_time = self.last_msg_per_group[conversation_id]
-                both_time_fallback = msg_id.startswith("TIME_") and last_id.startswith("TIME_")
-                if (msg_id == last_id or both_time_fallback) and msg_hash == last_hash:
-                    if time.time() - last_time < 300.0:
-                        return # Tin text trùng -> Bỏ qua
-        # Voice: chặn trùng lặp cả 2 trường hợp — có ID thật và không có ID thật
-        else:
-            if not msg_id.startswith("TIME_") and not msg_id.startswith("VIRTUAL_") and not msg_id.startswith("CONTENT_") and not msg_id.startswith("VOICE_"):
-                # Voice có ID thật → chặn 60s theo ID
-                voice_key = f"VOICE_REAL_{conversation_id}_{msg_id}"
-                if voice_key in self.processed_msg_hashes:
-                    if time.time() - self.processed_msg_hashes[voice_key] < 60.0:
-                        return
-                self.processed_msg_hashes[voice_key] = time.time()
-            else:
-                # Voice KHÔNG có ID thật → chặn 60s theo convId+hash nội dung
-                # Đây là nguyên nhân mỗi nhóm chỉ hiện 1 tin rồi im: JS stableId dùng timeString
-                # cố định nên zauto_seen đã chặn, nhưng nếu timeString thay đổi thì lọt qua
-                voice_fb_key = f"VOICE_FB_{conversation_id}_{msg_hash}"
-                if voice_fb_key in self.processed_msg_hashes:
-                    if time.time() - self.processed_msg_hashes[voice_fb_key] < 60.0:
-                        return
-                self.processed_msg_hashes[voice_fb_key] = time.time()
-
-        # Luôn cập nhật mốc mới nhất (cả voice lẫn text)
-        self.last_msg_per_group[conversation_id] = (msg_id, msg_hash, time.time())
-
-        # ==============================================================
-        # ✅ PHÂN LUỒNG XỬ LÝ (VOICE / TEXT) SAU KHI ĐÃ LỌC SẠCH BÓNG ĐÈ
-        # ==============================================================
-        
-        # Tạo khóa Cache cho UI (Để sau này chốt xong biết đường mà xóa)
-        cache_key = f"CACHE_{conversation_id}_{msg_hash}"
-
-        if is_voice:
-            duration = -1 
-            if "%%%" in msg:
-                try: duration = int(msg.split("%%%")[1])
-                except: pass
-            display_msg = "🔊 CÓ BẢN GHI ÂM MỚI"
-
-            # Tạo nội dung TTS thông báo để đưa vào audio_queue — phát tuần tự
-            sender_name = msg_clean.split(": ")[0].strip() if ": " in msg_clean else ""
-            clean_group = re.sub(r'[^\w\s]', '', group)
-            clean_sender = re.sub(r'[^\w\s]', '', sender_name) if sender_name else ""
-            tts_text = ""
-            if self.config_data.get('sw_voice', True):
-                tts_text = f"Có tin nhắn thoại của {clean_sender}, từ nhóm {clean_group}" if clean_sender else f"Có tin nhắn thoại từ nhóm {clean_group}"
-
-            if platform == 'android':
-                try:
-                    # Đưa cả TTS + lệnh play vào cùng 1 queue để xử lý tuần tự
-                    self.audio_queue.put(
-                        (conversation_id, msg_id, cache_key, duration, tts_text),
-                        timeout=0.5
-                    )
-                except queue.Full:
-                    logger.warning(f"Audio queue đầy, bỏ qua tin thoại nhóm {group}")
-            try:
-                self.ui_queue.put_nowait(('add_ride', (group, display_msg, msg_id, conversation_id, cache_key, msg)))
-                self.ui_queue.put_nowait(('log', (group, display_msg)))
-                # KHÔNG dùng ('speak',...) ở đây nữa — TTS đã đưa vào audio_queue phát tuần tự
-            except queue.Full: pass
-            return
-
-        else:
-            # --- 💬 LUỒNG TEXT ---
-            if sw_filter_active:
-                # BƯỚC 1: Loại bỏ tin chứa từ khóa BỎ QUA
-                loai_keys = [k.strip() for k in self.config_data.get('loai', '').lower().split(',') if k.strip()]
-                if loai_keys and any(lk in msg_content_only for lk in loai_keys):
-                    return # Chứa từ khóa bỏ qua -> Loại
-
-                nhan_keys = [k.strip() for k in self.config_data.get('nhan', '').lower().split(',') if k.strip()]
-                if nhan_keys and not any(nk in msg_content_only for nk in nhan_keys):
-                    return # Có từ khóa nhận nhưng tin không khớp -> Bỏ qua
-
-            # ✅ Vượt qua Filter -> Nổ Canh me
-            display_msg = msg
-            try:
-                self.ui_queue.put_nowait(('add_ride', (group, display_msg, msg_id, conversation_id, cache_key, msg)))
-                self.ui_queue.put_nowait(('log', (group, display_msg)))
-                
-                if self.config_data.get('sw_voice', True):
-                    clean_group = re.sub(r'[^\w\s]', '', group)
-                    self.ui_queue.put_nowait(('speak', f"Chú ý có cuốc xe mới từ nhóm {clean_group}"))
-            except queue.Full: pass
-
-            # 🚗 AUTO CHỐT
-            sw_auto_active = self.config_data.get('sw_auto', False)
-            if sw_auto_active:
-                final_reply = random.choice(replies) if replies else "Ok nhận"
-                self.queue_reply(group, conversation_id, msg_id, final_reply, display_msg)
-                
-                # BỔ SUNG: Gửi lệnh xóa ngay thẻ cuốc xe này khỏi Tab Canh me dựa vào cache_key
-                try:
-                    self.ui_queue.put_nowait(('remove_by_key', cache_key))
-                except queue.Full: pass
-    def sync_cookie_from_webview(self):
-        """Hút cookie từ Java WebView và gửi cho Node.js (Bản Đa Luồng chống đơ App)"""
-        if platform == 'android':
-            try:
-                from jnius import autoclass
-                import requests
-                import threading  # <--- Bắt buộc phải có để tạo luồng ngầm
-                from kivy.clock import Clock
-                
-                self.safe_toast("Đang đồng bộ dữ liệu Zalo...")
-                ZWebManager = autoclass('org.zauto.ZaloWebManager')
-                
-                # Gọi Java để hút đủ Bộ 3 Thần Thánh
-                raw_cookie = ZWebManager.extractZaloCookie()
-                imei = ZWebManager.getImei()
-                user_agent = ZWebManager.getUserAgent()
-                
-                if not raw_cookie or "zpw_sek" not in raw_cookie:
-                    self.safe_toast("❌ Bạn chưa đăng nhập Zalo trên khung Web bên dưới!")
-                    return
-                    
-                # Đóng gói cả 3 thông số gửi xuống Node.js
-                payload = {
-                    "raw_cookie": raw_cookie,
-                    "imei": imei,
-                    "user_agent": user_agent
-                }
-
-                # TẠO LUỒNG RIÊNG ĐỂ GỬI API - KHÔNG LÀM ĐƠ GIAO DIỆN
-                def _send_api_thread():
-                    try:
-                        # Tăng timeout lên 35 giây để Node.js có đủ thời gian mã hóa đăng nhập Zalo
-                        res = requests.post("http://127.0.0.1:5000/api/cookie_login", json=payload, timeout=35)
-                        
-                        if res.status_code == 200:
-                            self.safe_toast("✅ Đồng bộ thành công! Sẵn sàng nhận cuốc.")
-                            self.config_data['is_linked'] = True
-                            self.is_linked = True
-                            self.save_config_silent()
-                            
-                            # Kivy bắt buộc phải update UI trên luồng chính thông qua Clock
-                            def _update_ui_after_sync(dt):
-                                self.update_profile_ui()
-                                self.set_webview_visible(False)
-                                # ✅ Đổi nút thành HUỶ màu đỏ ngay lập tức để user biết
-                                try:
-                                    self.root.ids.btn_zalo_action.text = "HUỶ LIÊN KẾT ZALO"
-                                    self.root.ids.btn_zalo_action.md_bg_color = (0.8, 0.2, 0.2, 1)
-                                except: pass
-                            Clock.schedule_once(_update_ui_after_sync, 0)
-                        else:
-                            self.safe_toast("❌ Lỗi đồng bộ. Hãy thử lại!")
-                    except Exception as e:
-                        logger.error(f"Lỗi sync cookie ngầm: {e}")
-                        self.safe_toast("❌ Node.js chưa chạy xong, vui lòng đợi 5s và bấm lại.")
-                        
-                # Kích hoạt luồng chạy ngầm
-                threading.Thread(target=_send_api_thread, daemon=True).start()
-                
-            except Exception as e:
-                logger.error(f"Lỗi sync cookie: {e}")
-                self.safe_toast("❌ Lỗi kết nối đến Server ngầm.")
-    def _system_watchdog(self, dt):
-        """Khôi phục Worker, Tối ưu RAM và chặn nhân bản Thread"""
-        self.gc_counter += 1
-        if self.gc_counter % 10 == 0: # Ép xả RAM mức 2 định kỳ
-            try: gc.collect(2)
-            except: pass
-            
-        if not getattr(self, 'app_running', False): return
-
-        with self.worker_restart_lock:
-            if not hasattr(self, 'msg_worker_thread') or not self.msg_worker_thread.is_alive():
-                if not getattr(self, '_restarting_msg_worker', False):
-                    self._restarting_msg_worker = True
-                    self.msg_worker_thread = threading.Thread(target=self._message_worker, daemon=True)
-                    self.msg_worker_thread.start()
-                    self._restarting_msg_worker = False
-
-            if not hasattr(self, 'reply_worker_thread') or not self.reply_worker_thread.is_alive():
-                if not getattr(self, '_restarting_reply_worker', False):
-                    self._restarting_reply_worker = True
-                    self.reply_worker_thread = threading.Thread(target=self._reply_worker_loop, daemon=True)
-                    self.reply_worker_thread.start()
-                    self._restarting_reply_worker = False
-    def log_history(self, group, msg):
-        # Dùng List chuẩn Material của KivyMD
-        item = TwoLineAvatarIconListItem(text=f"[{time.strftime('%H:%M')}] {group}", secondary_text=msg)
-        item.add_widget(ImageLeftWidget(source="profile.jpg"))
-        self.root.ids.msg_history_list.add_widget(item, index=0)
-
-    def remove_ride(self, card_widget):
-        try:
-            if hasattr(card_widget, 'unbind'): card_widget.unbind()
-            card_widget.clear_widgets()
-            self.root.ids.ride_list.remove_widget(card_widget)
-            try: del card_widget
-            except: pass
-        except Exception as e:
-            logger.error(f"Lỗi remove_ride: {e}")
-    def _poll_nodejs_queue(self, dt):
-        import requests
-        try:
-            res = requests.get("http://127.0.0.1:5000/api/events", timeout=2)
-            if res.status_code == 200:
-                events = res.json().get("events", [])
-                for ev in events:
-                    action = ev.get("action")
-                    data = ev.get("data", {})
-
-                    if action == 'LOGIN_SUCCESS':
-                        self.is_linked = True
-                        
-                        # 1. Lấy thông tin Tên và Avatar do Node.js gửi sang
-                        zalo_name = data.get('name', 'Tài khoản Zalo')
-                        zalo_avatar = data.get('avatar', 'profile.jpg')
-                        
-                        # 2. Cập nhật thanh trạng thái phía trên
-                        self.config_data['is_linked'] = True
-                        self.config_data['zalo_name'] = zalo_name
-                        self.config_data['zalo_avatar'] = zalo_avatar
-                        self.save_config_silent()
-                        Clock.schedule_once(lambda dt: self.update_profile_ui(), 0)
-                        
-                        # 3. VẼ GIAO DIỆN AVATAR VÀO KHOẢNG TRỐNG BÊN DƯỚI
-                        def _show_profile_center(dt):
-                            try:
-                                from kivy.uix.boxlayout import BoxLayout
-                                from kivy.uix.label import Label
-                                from kivymd.uix.fitimage import FitImage
-                                from kivy.metrics import dp
-                                
-                                container = self.root.ids.webview_container
-                                container.clear_widgets()
-                                
-                                # Tạo một khối Box nằm giữa màn hình
-                                box = BoxLayout(
-                                    orientation='vertical', 
-                                    spacing=dp(10),
-                                    size_hint=(1, None), 
-                                    height=dp(250),
-                                    pos_hint={'center_x': 0.5, 'center_y': 0.5}
-                                )
-                                
-                                # Tranh thủ tải Avatar hình tròn
-                                avatar_img = FitImage(
-                                    source=zalo_avatar, 
-                                    size_hint=(None, None), 
-                                    size=(dp(120), dp(120)), 
-                                    radius=[dp(60)], # Bo tròn 50%
-                                    pos_hint={'center_x': 0.5}
-                                )
-                                
-                                # Tên Zalo
-                                name_lbl = Label(
-                                    text=zalo_name, 
-                                    color=(0.1, 0.1, 0.1, 1), 
-                                    bold=True, 
-                                    font_size='22sp', 
-                                    size_hint_y=None, height=dp(40)
-                                )
-                                
-                                # Trạng thái
-                                status_lbl = Label(
-                                    text="✅ Đã kết nối API Zalo ngầm\nSẵn sàng nhận cuốc tự động!", 
-                                    color=(0.1, 0.6, 0.2, 1), 
-                                    font_size='15sp', 
-                                    halign="center",
-                                    size_hint_y=None, height=dp(50)
-                                )
-                                
-                                box.add_widget(Label(size_hint_y=1)) # Lót trên
-                                box.add_widget(avatar_img)
-                                box.add_widget(name_lbl)
-                                box.add_widget(status_lbl)
-                                box.add_widget(Label(size_hint_y=1)) # Lót dưới
-                                
-                                container.add_widget(box)
-                            except Exception as e:
-                                logger.error(f"Lỗi vẽ Profile Center: {e}")
-                                
-                        Clock.schedule_once(_show_profile_center, 0)
-                        self.safe_toast("Đã liên kết API Zalo thành công!")
-
-                    elif action == 'GROUPS_DATA':
-                        groups = data.get('groups', [])
-                        Clock.schedule_once(lambda dt, g=groups: self.update_group_list_ui(g), 0)
-
-                    elif action == 'REQUIRE_QR':
-                        qr_url = data.get('url')
-                        Clock.schedule_once(lambda dt, u=qr_url: self.show_qr_code(u), 0)
-
-                    elif action == 'QR_EXPIRED':
-                        self.safe_toast("⏰ QR hết hạn, đang tạo mã mới...")
-
-                    elif action == 'QR_SCANNED':
-                        name = data.get('name', '')
-                        self.safe_toast(f"📱 Đã quét QR: {name}")
-
-                    elif action == 'QR_DECLINED':
-                        self.safe_toast("❌ Người dùng từ chối đăng nhập")
-
-                    elif action == 'LOGIN_ERROR':
-                        self.safe_toast(f"❌ Lỗi Zalo: {data.get('error', '')[:60]}")
-
-                    # ✅ XỬ LÝ TIN NHẮN TEXT
-                    elif action == 'WEB_NEW_MSG':
-                        if getattr(self, 'is_radar_running', False):
-                            group_id = data.get('group_id', '')
-                            group_name = data.get('group_name', group_id) # ✅ Lấy TÊN NHÓM thật
-                            sender = data.get('sender_name', '')
-                            text = data.get('text', '')
-                            msg_id = data.get('msg_id', '')
-                            is_group = data.get('is_group', True)
-                            full_msg = f"{sender}: {text}" if sender else text
-                            self.msg_queue.put_nowait((
-                                'WEB_NEW_MSG',
-                                {
-                                    'group': group_name,
-                                    'msg': full_msg,
-                                    'msg_id': msg_id,
-                                    'conversation_id': group_id,
-                                    'is_group': is_group
-                                }
-                            ))
-
-                    # ✅ XỬ LÝ TIN THOẠI
-                    elif action == 'WEB_NEW_VOICE':
-                        if getattr(self, 'is_radar_running', False):
-                            group_id = data.get('group_id', '')
-                            group_name = data.get('group_name', group_id) # ✅ Lấy TÊN NHÓM thật
-                            sender = data.get('sender_name', '')
-                            msg_id = data.get('msg_id', '')
-                            voice_url = data.get('voice_url', '')
-                            is_group = data.get('is_group', True)
-                            voice_text = f"{sender}: [tin nhắn thoại]%%%-1" if sender else "[tin nhắn thoại]%%%-1"
-                            self.msg_queue.put_nowait((
-                                'WEB_NEW_MSG',
-                                {
-                                    'group': group_name,
-                                    'msg': voice_text,
-                                    'msg_id': msg_id,
-                                    'conversation_id': group_id,
-                                    'is_group': is_group,
-                                    'voice_url': voice_url,
-                                    'raw_data': data.get('raw_data', {})
-                                }
-                            ))
-
-                    # ✅ XỬ LÝ TIN NHẮN ẢNH (BẮT CUỐC QUA HÌNH CHỤP)
-                    elif action == 'WEB_NEW_PHOTO':
-                        if getattr(self, 'is_radar_running', False):
-                            group_id = data.get('group_id', '')
-                            group_name = data.get('group_name', group_id) # ✅ Lấy TÊN NHÓM thật
-                            sender = data.get('sender_name', '')
-                            photo_url = data.get('photo_url', '')
-                            msg_id = data.get('msg_id', '')
-                            is_group = data.get('is_group', True)
-                            raw_data = data.get('raw_data', {})
-                            
-                            if photo_url:
-                                threading.Thread(
-                                    target=self._process_image_ocr_thread,
-                                    args=(photo_url, group_id, group_name, sender, msg_id, is_group, raw_data), # ✅ Pass CẢ ID LẪN TÊN
-                                    daemon=True
-                                ).start()
-        except requests.exceptions.RequestException:
-            pass
-        except Exception as e:
-            logger.error(f"Lỗi poll Node.js: {e}")
-
-    # ==============================================================
-    # HÀM MỚI: TẢI ẢNH QR VÀ NHÉT VÀO KHOẢNG TRỐNG TRÊN MÀN HÌNH
-    # ==============================================================
-    def show_qr_code(self, url):
-        # Cập nhật UI ngay trước khi tải
-        self.root.ids.zalo_name_view.text = "CẦN QUÉT MÃ QR BÊN DƯỚI"
-        self.root.ids.btn_zalo_action.text = "ĐANG CHỜ QUÉT..."
-        self.root.ids.btn_zalo_action.md_bg_color = (0.8, 0.4, 0.1, 1)
-        self.root.ids.bottom_nav.switch_tab('tab_zalo')
-
-        # ✅ ẨN WEBVIEW JAVA ĐI ĐỂ QR KIVY KHÔNG BỊ CHE
-        if platform == 'android':
-            try:
-                self.set_webview_visible(False)
-            except Exception as e:
-                logger.error(f"Lỗi ẩn WebView khi show QR: {e}")
-
-        # ✅ TẢI ẢNH TRÊN LUỒNG RIÊNG, KHÔNG BLOCK KIVY UI
-        def _load_qr_thread():
-            try:
-                import requests
-                from io import BytesIO
-                from kivy.core.image import Image as CoreImage
-
-                response = requests.get(url, timeout=5)
-                if response.status_code == 200:
-                    image_data = BytesIO(response.content)
-                    # CoreImage phải tạo trước khi lên UI
-                    core_image = CoreImage(image_data, ext="png")
-
-                    # ✅ Chỉ thao tác Widget trên luồng UI
-                    def _update_ui(dt):
-                        try:
-                            from kivy.uix.image import Image as KivyImage
-                            container = self.root.ids.webview_container
-                            container.clear_widgets()
-                            qr_widget = KivyImage(texture=core_image.texture, size_hint=(1, 1))
-                            container.add_widget(qr_widget)
-                        except Exception as e:
-                            logger.error(f"Lỗi vẽ QR lên UI: {e}")
-
-                    Clock.schedule_once(_update_ui, 0)
-            except Exception as e:
-                logger.error(f"Lỗi tải ảnh QR: {e}")
-
-        threading.Thread(target=_load_qr_thread, daemon=True).start()
-    def _nodejs_poll_worker(self):
-        """Worker cào dữ liệu từ Node.js API ngầm 24/24"""
-        # Chờ Node.js khởi động xong trước khi bắt đầu poll
-        # (Node.js cần ~5-10 giây để load xong trên Android)
-        time.sleep(10)
-        while getattr(self, 'app_running', True):
-            try:
-                self._poll_nodejs_queue(None)
-            except Exception:
-                pass
-            time.sleep(0.5)
-
-    def add_ride_card(self, group, msg, msg_id="", conversation_id="", cache_key="", raw_msg=""):
-        try:
-            max_rides = 30
-            ride_list = self.root.ids.ride_list
-            while len(ride_list.children) >= max_rides:
-                old_card = ride_list.children[-1]
-                ride_list.remove_widget(old_card)
-                old_card.clear_widgets()
-                del old_card
-            card = RideCard(group_text=group, msg_text=msg, time_text=time.strftime("%H:%M"))
-            card.msg_id = msg_id
-            card.conversation_id = conversation_id
-            card.cache_key = cache_key # ĐÃ FIX: Nhận tham số cache_key để sau này xóa bộ đệm
-            card.raw_msg = raw_msg if raw_msg else msg  # Nội dung gốc để Java tìm đúng tin click đúp
-            self.root.ids.ride_list.add_widget(card, index=0)
-            
-            # TỰ XÓA CUỐC SAU 2 PHÚT (120 GIÂY) ĐỂ MÀN HÌNH CANH ME SẠCH SẼ
-            Clock.schedule_once(lambda dt: self.auto_remove_card(card), 120)
-        except Exception: logger.error(traceback.format_exc())
-
-    def auto_remove_card(self, card_widget):
-        try:
-            if card_widget in self.root.ids.ride_list.children:
-                self.remove_ride(card_widget)
-        except Exception: pass
-
-    def manual_accept_ride(self, card_widget):
-        # Ẩn bàn phím TRƯỚC KHI CHỐT — tránh IME bật lên khi JS điền text vào input
-        
-
-        raw_reply = self.root.ids.inp_reply.text
-        replies = [r.strip() for r in raw_reply.split(',') if r.strip()]
-        final_reply = random.choice(replies) if replies else "Ok nhận"
-
-        self.queue_reply(
-            card_widget.group_text,
-            getattr(card_widget, 'conversation_id', ''),
-            getattr(card_widget, 'msg_id', ''),
-            final_reply,
-            getattr(card_widget, 'raw_msg', card_widget.msg_text),
-            force_manual=True
-        )
-        toast(f"Đang chốt: {card_widget.group_text}")
-        self.remove_ride(card_widget)
-
-    def queue_reply(self, group, conversation_id, msg_id, reply_text, msg_content="", force_manual=False):
-        now = time.time()
-        try:
-            user_delay = float(self.config_data.get('global_delay', '30'))
-        except:
-            user_delay = 30.0
-
-        # Chỉ kiểm tra delay khi là auto chốt, bấm tay thì luôn cho qua
-        if not force_manual:
-            with self.reply_time_lock:
-                time_passed = now - getattr(self, 'last_global_reply_time', 0)
-                if time_passed < user_delay:
-                    return 
-                self.last_global_reply_time = now
-
-        cache_key = f"{conversation_id}_{msg_id}_{hashlib.md5(reply_text.encode('utf-8')).hexdigest()[:6]}"
-        if now - self.last_reply_time.get(cache_key, 0) < 10: return 
-        self.last_reply_time[cache_key] = now
-
-        if self.reply_queue.qsize() > 40: return
-        
-        try:
-            self.reply_queue.put({
-                'group': group, 
-                'conversation_id': conversation_id, 
-                'msg_id': msg_id, 
-                'reply_text': reply_text, 
-                'msg_content': msg_content,
-                'group_name': group
-            }, timeout=0.3)
-            
-            # Thông báo cho người dùng
-            self.safe_toast(f"⏳ Đang gửi vào nhóm {group}...")
-            
-            # Xử lý giọng nói
-            if self.config_data.get('sw_voice', True):
-                try:
-                    # Đảm bảo regex không chứa ký tự lạ gây lỗi bộ giải mã giọng nói
-                    clean_group_name = re.sub(r'[^\w\s]', '', str(group))
-                    self.ui_queue.put_nowait(('speak', f"Đang chốt nhóm {clean_group_name}"))
-                except Exception as e:
-                    logging.error(f"Lỗi giọng nói: {e}")
-                    pass
-        except queue.Full:
-            pass
-
-    def _execute_reply_safe(self, payload):
-        """HÀM GỌI XUỐNG NODE.JS API — SIÊU NHẸ, KHÔNG CẦN WEBVIEW"""
-        import requests
-        import threading
-
-        def _do_send_api():
-            try:
-                # Gom dữ liệu khớp với API của sendMessage.ts bên Node.js
-                # Thay đoạn data = { ... } cũ bằng:
-                data = {
-                    "group_id": payload.get('conversation_id', ''),
-                    "message": payload.get('reply_text', ''),
-                    "is_group": True  # ✅ THÊM: Node.js cần field này để biết gửi nhóm hay cá nhân
-                }
-                # Gửi request sang Node.js đang chạy ngầm ở port 5000
-                res = requests.post("http://127.0.0.1:5000/api/reply", json=data, timeout=5)
-                
-                if res.status_code == 200:
-                    self.safe_toast("✅ Chốt cuốc API thành công!")
-                    if self.config_data.get('sw_voice', True):
-                        self.ui_queue.put_nowait(('speak', "Chốt cuốc xe thành công"))
-                else:
-                    self.safe_toast("❌ Lỗi chốt cuốc!")
-            except Exception as e:
-                logger.error(f"Lỗi gửi chốt cuốc API: {e}")
-
-        # Chạy luồng riêng để không đơ giao diện Kivy
-        threading.Thread(target=_do_send_api, daemon=True).start()
-    
-    def load_config(self):
-        try:
-            conn = sqlite3.connect(DB_PATH, timeout=15.0, isolation_level=None)
-            c = conn.cursor()
-            c.execute("SELECT key_name, value_data FROM config")
-            rows = c.fetchall()
-            conn.close()
-
-            # Đặt khung mặc định an toàn trước
-            self.config_data = {
-                'nhan': '', 'loai': '', 'reply_msg': 'Ok nhận',
-                'sw_filter': False, 'sw_auto': False, 'is_linked': False, 
-                'enabled_groups': {}, 'zalo_name': 'Chưa kết nối Zalo', 'zalo_avatar': 'profile.jpg'
+    }
+
+    private static String escapeJs(String s) {
+        if (s == null) return "";
+        return s.replace("\\", "\\\\")
+                .replace("'", "\\'")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\r", "");
+    }
+
+    private static void safeEvaluateJs(String js) {
+        if (hiddenWebView != null && hiddenWebView.getParent() != null) {
+            hiddenWebView.post(() -> hiddenWebView.evaluateJavascript(js, null));
+        }
+    }
+
+    // =========================================================
+    // SAFE RELOAD 
+    // =========================================================
+    public static void safeReload() {
+        long now = System.currentTimeMillis();
+        if (now - firstReloadInWindow > 60000) {
+            reloadCountWindow = 0;
+            firstReloadInWindow = now;
+        }
+        if (reloadCountWindow >= 3) {
+            Log.e(TAG, "ANTI-LOOP: Blocked too many reloads!");
+            return;
+        }
+        if (now - lastReloadTime > 15000) {
+            Log.w(TAG, "PERFORMING SAFE RELOAD...");
+            reloadCountWindow++;
+            if (hiddenWebView != null) {
+                hiddenWebView.post(() -> hiddenWebView.reload());
             }
-            # Nếu có data từ DB thì đè lên
-            if rows:
-                for k, v in rows: 
-                    self.config_data[k] = json.loads(v)
+            lastReloadTime = now;
+        }
+    }
 
-            self.is_linked = self.config_data.get('is_linked', False)
-            self.enabled_groups = self.config_data.get('enabled_groups', {})
+    // =========================================================================
+    // NÂNG CẤP ĐỘNG CƠ: HYBRID VISION-API AUTOMATION ENGINE (TẦNG 1 & TẦNG 3)
+    // =========================================================================
+    // =========================================================================
+    // ĐỘNG CƠ CHỐT CUỐC V5.0 - IRON FIST ENGINE
+    // Đảm bảo 100% đè tin gửi kèm (quote) dù text hay voice, dài hay ngắn
+    // Luồng: API Webpack → Click Đúp Siêu Mạnh (4 chiến lược) → Enter fallback
+    // =========================================================================
+    public static void sendReplyToSpecificMessage(
+            final Activity activity,
+            final String conversationId,
+            final String msgId,
+            final String text,
+            final String msgTextToFind,
+            final String sentTime) {
 
-            ids = self.root.ids
-            if ids.get('inp_nhan'): ids.inp_nhan.text = self.config_data.get('nhan', '')
-            if ids.get('inp_loai'): ids.inp_loai.text = self.config_data.get('loai', '')
-            if ids.get('inp_reply'): ids.inp_reply.text = self.config_data.get('reply_msg', 'Ok nhận')
-            if ids.get('inp_ocr_key'): ids.inp_ocr_key.text = self.config_data.get('ocr_api_key', 'K86976001788957')
-            if ids.get('inp_delay'): ids.inp_delay.text = self.config_data.get('global_delay', '30')
-            if ids.get('sw_filter'): ids.sw_filter.active = self.config_data.get('sw_filter', False)
-            
-            # --- THÊM DÒNG LOAD TRẠNG THÁI NÚT GIỌNG NÓI ---
-            if ids.get('sw_voice'): ids.sw_voice.active = self.config_data.get('sw_voice', True)
-            
-            is_auto = self.config_data.get('sw_auto', False)
-            if ids.get('sw_auto_settings'): ids.sw_auto_settings.active = is_auto
+        Activity safeActivity = activityRef != null ? activityRef.get() : activity;
+        if (safeActivity == null || hiddenWebView == null) return;
 
-            self.update_profile_ui()
-            if self.enabled_groups:
-                Clock.schedule_once(lambda dt: self.update_group_list_ui(self.enabled_groups.keys()), 0)
-        except Exception as e:
-            logger.error(f"Lỗi SQLite Load: {e}")
+        replyQueue.add(() -> safeActivity.runOnUiThread(() -> {
+            try {
+                String safeReply      = escapeJs(text);
+                String safeSearch     = escapeJs(msgTextToFind != null ? msgTextToFind : "");
+                String safeMsgId      = escapeJs(msgId != null ? msgId : "");
+                String safeTime       = escapeJs(sentTime != null ? sentTime : "");
+                String safeConvId     = escapeJs(conversationId != null ? conversationId : "");
 
-    def save_config_silent(self):
-        try:
-            with db_lock:
-                conn = sqlite3.connect(DB_PATH, timeout=15.0, isolation_level=None)
-                c = conn.cursor()
-                for k, v in self.config_data.items():
-                    c.execute("INSERT OR REPLACE INTO config (key_name, value_data) VALUES (?, ?)", (k, json.dumps(v)))
-                conn.close()
-        except Exception as e:
-            logger.error(f"Lỗi SQLite Save: {e}")
-    
+                String jsCode =
+                "(function() { try {" +
 
-    def update_profile_ui(self):
-        try:
-            ids = self.root.ids
+                // ─────────────────────────────────────────────────────────────
+                // BIẾN TOÀN CỤC TRONG CLOSURE
+                // ─────────────────────────────────────────────────────────────
+                "var _convId      = '" + safeConvId + "';" +
+                "var _reply       = '" + safeReply  + "';" +
+                "var _search      = '" + safeSearch + "';" +
+                "var _targetId    = '" + safeMsgId  + "';" +
+                "var _sentTime    = '" + safeTime   + "';" +
 
-            if 'zalo_name_view' in ids:
-                ids.zalo_name_view.text = self.config_data.get('zalo_name', "Đã kết nối") if self.is_linked else "Chưa kết nối Zalo"
+                // ─────────────────────────────────────────────────────────────
+                // BƯỚC 0: KHÁM PHÁ WEBPACK API (GIỮ NGUYÊN TỪ BẢN CŨ)
+                // ─────────────────────────────────────────────────────────────
+                "function _discoverApi() {" +
+				"   if (window.zMessenger && typeof window.zMessenger.sendMessage==='function') return true;" +
 
-            if 'zalo_avatar_view' in ids:
-                ids.zalo_avatar_view.source = self.config_data.get('zalo_avatar', 'profile.jpg') if self.is_linked else 'profile.jpg'
+				// ── DUCK TYPING helper: nhận dạng đúng object API của Zalo ──────────
+				"   var _isApi = function(obj) {" +
+				"       if (!obj || typeof obj !== 'object') return false;" +
+				// Zalo bắt buộc phải có sendMessage + (sendMsg HOẶC sendTextMessage)
+				"       return typeof obj.sendMessage==='function' && " +
+				"              (typeof obj.sendMsg==='function' || typeof obj.sendTextMessage==='function');" +
+				"   };" +
+				"   var _deepFind = function(obj) {" +
+				"       if (_isApi(obj)) { window.zMessenger=obj; return true; }" +
+				"       if (!obj || typeof obj!=='object') return false;" +
+				"       var keys=Object.keys(obj);" +
+				"       for(var i=0;i<keys.length;i++){" +
+				"           var c=obj[keys[i]];" +
+				"           if(c && typeof c==='object' && _isApi(c)){window.zMessenger=c;return true;}" +
+				"       }" +
+				"       return false;" +
+				"   };" +
 
-            if 'btn_zalo_action' in ids:
-                btn = ids.btn_zalo_action
-                # Xóa binding cũ trước khi gắn mới tránh gọi 2 lần
-                try: btn.unbind_all(btn)
-                except: pass
-                if self.is_linked:
-                    btn.text = "HUỶ LIÊN KẾT ZALO"
-                    btn.md_bg_color = (0.8, 0.2, 0.2, 1)
-                    btn.bind(on_release=lambda x: self._do_unlink_zalo())
-                else:
-                    btn.text = "1. ĐỒNG BỘ ZALO"
-                    btn.md_bg_color = (0.1, 0.6, 0.2, 1)
-                    btn.bind(on_release=lambda x: self.sync_cookie_from_webview())
-        except Exception as e:
-            print(f"Lỗi UI Profile: {e}")
+				// ── TẦNG 1: WEBPACK CACHE DUMP — Vét cạn RAM module đã load ─────────
+				// Kỹ thuật này bất tử trước obfuscation vì không dùng tên biến
+				"   try {" +
+				"       var wreq = window.__webpack_require__ || window.webpackRequire || null;" +
+				// Tìm mọi webpackChunk* trong window (không đoán tên cứng)
+				"       if (!wreq) {" +
+				"           var chunkKeys = Object.keys(window).filter(function(k){return k.startsWith('webpackChunk');});" +
+				"           for (var ck=0; ck<chunkKeys.length && !wreq; ck++) {" +
+				"               try { window[chunkKeys[ck]].push([[Math.random()],{},function(r){wreq=r;}]); } catch(e){}" +
+				"           }" +
+				"       }" +
+				"       if (wreq && wreq.c) {" +
+				"           var ckeys=Object.keys(wreq.c);" +
+				"           for (var j=0;j<ckeys.length;j++) {" +
+				"               var entry=wreq.c[ckeys[j]];" +
+				"               var exp=entry&&entry.exports;" +
+				"               if(exp&&(_deepFind(exp.default)||_deepFind(exp))){" +
+				"                   console.log('[ZAuto] API found in webpack cache');" +
+				"                   return true;" +
+				"               }" +
+				"           }" +
+				"       }" +
+				// Fallback: quét req.m nếu cache chưa load đủ
+				"       if (wreq && wreq.m) {" +
+				"           var mkeys=Object.keys(wreq.m);" +
+				"           for (var mi=0;mi<mkeys.length;mi++){" +
+				"               try{" +
+				"                   var mm=wreq(mkeys[mi]); var me=mm&&(mm.default||mm);" +
+				"                   if(me&&_isApi(me)){window.zMessenger=me;return true;}" +
+				"               }catch(e){}" +
+				"           }" +
+				"       }" +
+				"   } catch(e1) {}" +
 
-    def _do_unlink_zalo(self):
-        """Huỷ liên kết Zalo — xóa cookie.json và reset trạng thái"""
-        try:
-            import requests
-            # Yêu cầu Node.js restart (xóa cookie.json phía server)
-            try:
-                requests.post("http://127.0.0.1:5000/api/restart", timeout=3)
-            except: pass
-            self.is_linked = False
-            self.config_data['is_linked'] = False
-            self.config_data['zalo_name'] = 'Chưa kết nối Zalo'
-            self.config_data['zalo_avatar'] = 'profile.jpg'
-            self.save_config_silent()
-            self.update_profile_ui()
-            # Hiện lại WebView để đăng nhập lại
-            self.set_webview_visible(True)
-            self.safe_toast("Đã huỷ liên kết. Vui lòng đăng nhập lại.")
-        except Exception as e:
-            logger.error(f"Lỗi huỷ liên kết: {e}")
-    def _init_webview_android(self):
-        if self.webview_inited: return
-        if platform == 'android':
-            try:
-                activity = PythonActivity.mActivity
-                autoclass('org.zauto.ZaloWebManager').initWebView(activity)
-                self.webview_inited = True
-            except Exception:
-                print(traceback.format_exc())
+				// ── TẦNG 2: REACT FIBER / REDUX STORE HIJACK ────────────────────────
+				"   try {" +
+				"       var roots=[document.querySelector('#app'),document.querySelector('#main-app')," +
+				"                  document.querySelector('[class*=chat-window]'),document.querySelector('[class*=MessageList]')]" +
+				"                 .filter(Boolean);" +
+				"       for (var r=0;r<roots.length;r++) {" +
+				"           var rk=Object.keys(roots[r]).find(function(k){return k.startsWith('__reactFiber')||k.startsWith('__reactContainer');});" +
+				"           if (!rk) continue;" +
+				"           var nd=roots[r][rk]; var dep=0;" +
+				"           while(nd && dep<1000){" +
+				"               var props=nd.memoizedProps||nd.pendingProps;" +
+				"               if (props && props.store && typeof props.store.getState==='function') {" +
+				"                   var st=props.store.getState();" +
+				"                   if (_deepFind(st)) { console.log('[ZAuto] API found in Redux store'); return true; }" +
+				"               }" +
+				// Quét thêm memoizedState (Zustand/Context)
+				"               var ms=nd.memoizedState;" +
+				"               if (ms && ms.memoizedState && _deepFind(ms.memoizedState)) return true;" +
+				"               nd=nd.child||nd.sibling||(nd.return?nd.return.sibling:null); dep++;" +
+				"           }" +
+				"       }" +
+				"   } catch(e2) {}" +
 
-    def set_webview_visible(self, is_visible):
-        # --- THÊM 2 DÒNG NÀY ĐỂ BẢO VỆ GIAO DIỆN ---
-        # Nếu đã liên kết Node.js thành công -> Cấm hiện lại WebView để không đè UI
-        if is_visible and getattr(self, 'is_linked', False):
-            is_visible = False
+				// ── TẦNG 3: HOOK XHR + FETCH — Bắt URL thật khi Zalo tự gửi tin ────
+				// Dùng khi 2 tầng trên thất bại — lần sau Zalo gửi tin ta có URL
+				"   if (!window._zauto_hook_set) {" +
+				"       window._zauto_hook_set = true;" +
+				"       try {" +
+				"           var oXHR=window.XMLHttpRequest.prototype.open;" +
+				"           window.XMLHttpRequest.prototype.open=function(method,url){" +
+				"               if(typeof url==='string'&&(url.includes('sendmsg')||url.includes('send_msg')||url.includes('message/send')))" +
+				"                   window._zauto_send_url=url;" +
+				"               return oXHR.apply(this,arguments);" +
+				"           };" +
+				"           var oFetch=window.fetch;" +
+				"           window.fetch=function(input,init){" +
+				"               var url=typeof input==='string'?input:(input&&input.url||'');" +
+				"               if(url.includes('sendmsg')||url.includes('send_msg')||url.includes('message/send')){" +
+				"                   window._zauto_send_url=url;" +
+				"                   if(init&&init.body){try{window._zauto_last_payload=JSON.parse(init.body);}catch(e){}}" +
+				"               }" +
+				"               return oFetch.apply(this,arguments);" +
+				"           };" +
+				"       } catch(e3) {}" +
+				"   }" +
 
-        self.webview_visible = is_visible
-        if is_visible:
-            self.update_profile_ui()
-            self.last_webview_bounds = None
-            if not getattr(self, '_webview_timer', None):
-                self._webview_timer = Clock.schedule_interval(self._sync_webview_pos, 0.2)
-            def _do_resume(dt):
-                if platform == 'android' and getattr(self, 'webview_inited', False):
-                    try:
-                        from jnius import autoclass
-                        PythonActivity = autoclass('org.kivy.android.PythonActivity')
-                        autoclass('org.zauto.ZaloWebManager').onResume(PythonActivity.mActivity)
-                    except Exception: pass
-            Clock.schedule_once(_do_resume, 0.5)
-        else:
-            if getattr(self, '_webview_timer', None):
-                self._webview_timer.cancel()
-                self._webview_timer = None
-            if platform == 'android' and self.webview_inited:
-                self._hide_webview_overlay()
+				"   return !!window.zMessenger;" +
+				"}" +
+				"_discoverApi();" +
 
-    @run_on_ui_thread
-    def _hide_webview_overlay(self):
-        try:
-            autoclass('org.zauto.ZaloWebManager').updateWebViewBounds(
-                PythonActivity.mActivity, 0, 0, 0, 0, False)
-        except Exception: pass
+                // ─────────────────────────────────────────────────────────────
+                // BƯỚC 1: MỞ ĐÚNG NHÓM (GIỮ NGUYÊN + TĂNG TIMEOUT 3500ms)
+                // ─────────────────────────────────────────────────────────────
+                "function _openGroup(cb) {" +
+				"   if (!_convId || _convId==='') {" +
+				// Không có convId — kiểm tra xem đang mở đúng nhóm chưa bằng _search (tên nhóm)
+				"       if (_search && _search.length > 1) {" +
+				"           var nameEls = document.querySelectorAll('.conv-item-title__name,[class*=conv-name],[class*=group-name]');" +
+				"           for (var ni=0; ni<nameEls.length; ni++) {" +
+				"               if ((nameEls[ni].textContent||'').trim().includes(_search.substring(0,15))) {" +
+				"                   var convItem2 = nameEls[ni].closest('.msg-item,.conv-item');" +
+				"                   if (convItem2) { convItem2.click(); setTimeout(function(){cb(true);},2000); return; }" +
+				"               }" +
+				"           }" +
+				"       }" +
+				"       cb(true); return;" +
+				"   }" +
+                "   var item = document.querySelector('.msg-item[anim-data-id='+_convId+'] .conv-item')" +
+                "           || document.querySelector('.msg-item[anim-data-id='+_convId+']')" +
+                "           || document.querySelector('[id*='+_convId+']');" +
+                "   if (!item) {" +
+                "       var all = document.querySelectorAll('.msg-item,.conv-item');" +
+                "       for (var i=0;i<all.length;i++) {" +
+                "           var rk=Object.keys(all[i]).find(k=>k.startsWith('__reactFiber')||k.startsWith('__reactProps'));" +
+                "           if (rk && all[i][rk]) {" +
+                "               var p=all[i][rk].memoizedProps||all[i][rk].pendingProps;" +
+                "               if (p&&((p.session&&String(p.session.id)===_convId)||(p.convId&&String(p.convId)===_convId))) {item=all[i];break;}" +
+                "           }" +
+                "       }" +
+                "   }" +
+                "   if (!item) { cb(false); return; }" +
+                "   item.scrollIntoView({block:'center'}); item.click();" +
+                "   var rk=Object.keys(item).find(k=>k.startsWith('__reactEventHandlers')||k.startsWith('__reactFiber'));" +
+                "   if (rk&&item[rk]) {" +
+                "       var h=item[rk].onClick||(item[rk].return&&item[rk].return.memoizedProps&&item[rk].return.memoizedProps.onClick);" +
+                "       if (h) h({preventDefault:function(){},stopPropagation:function(){}});" +
+                "   }" +
+                "   setTimeout(function(){cb(true);}, 3500);" +
+                "}" +
 
-    def _sync_webview_pos(self, dt):
-        if platform != 'android' or not getattr(self, 'webview_inited', False) or not getattr(self, 'webview_visible', False):
-            return
-        try:
-            container = self.root.ids.webview_container
-            if not container.get_root_window():
-                return
-            x, y = container.to_window(0, 0)
-            w, h = container.size
-            android_y = Window.height - (y + h)
-            new_bounds = (int(x), int(android_y), int(w), int(h))
-            if new_bounds == getattr(self, 'last_webview_bounds', None):
-                return
-            if int(w) <= 0 or int(h) <= 0:
-                return
-            self.last_webview_bounds = new_bounds
-            autoclass('org.zauto.ZaloWebManager').updateWebViewBounds(
-                PythonActivity.mActivity,
-                new_bounds[0], new_bounds[1], new_bounds[2], new_bounds[3], True
-            )
-        except Exception: pass        
-            
+                // ─────────────────────────────────────────────────────────────
+                // BƯỚC 2: TÌM NODE TIN NHẮN (GIỮ NGUYÊN TOÀN BỘ LOGIC CŨ)
+                // ─────────────────────────────────────────────────────────────
+                "function _findNode() {" +
+				"   var node = null;" +
+				"   var isVoice = _search.toLowerCase().includes('tin nh\\u1eafn tho\\u1ea1i')||_search.toLowerCase().includes('[tin nh\\u1eafn tho\\u1ea1i]')||_search.toLowerCase().includes('voice')||_search.toLowerCase().includes('audio');" +
 
-    def save_config(self):
-        """BẮT BUỘC ĐỌC UI VÀO BIẾN TRƯỚC KHI XUỐNG DB"""
-        try:
-            ids = self.root.ids
-            if ids.get('inp_nhan'): self.config_data['nhan'] = ids.inp_nhan.text
-            if ids.get('inp_loai'): self.config_data['loai'] = ids.inp_loai.text
-            if ids.get('inp_reply'): self.config_data['reply_msg'] = ids.inp_reply.text
-            if ids.get('inp_ocr_key'): self.config_data['ocr_api_key'] = ids.inp_ocr_key.text.strip()
-            if ids.get('inp_delay'): self.config_data['global_delay'] = ids.inp_delay.text
-            if ids.get('sw_filter'): self.config_data['sw_filter'] = ids.sw_filter.active
-            if ids.get('sw_auto_main'): self.config_data['sw_auto'] = ids.sw_auto_main.active
-            
-            # --- THÊM DÒNG LƯU TRẠNG THÁI NÚT GIỌNG NÓI ---
-            if ids.get('sw_voice'): self.config_data['sw_voice'] = ids.sw_voice.active
-            
-            self.config_data['enabled_groups'] = self.enabled_groups
-            self.config_data['is_linked'] = self.is_linked
-            
-            self.save_config_silent()
-            self.safe_toast("Đã lưu cấu hình thành công!")
-        except Exception as e:
-            logger.error(f"Lỗi save_config: {e}")   
+				// ── ƯU TIÊN 0: data-qid parse — nguồn vàng chứa msgId thật ──────────
+				// Format: "senderId@convId_msgId_groupId"
+				"   var _parseQid = function(el) {" +
+				"       var qv = el && el.getAttribute && el.getAttribute('data-qid');" +
+				"       if (!qv) return null;" +
+				"       var at = qv.indexOf('@'); var parts = qv.split('_');" +
+				"       if (parts.length < 2) return null;" +
+				"       var afterAt = at >= 0 ? qv.substring(at+1) : qv;" +
+				"       var subParts = afterAt.split('_');" +
+				"       return { msgId: subParts[1]||parts[1]||'', senderId: at>=0 ? qv.substring(0,at) : '', convId: subParts[0]||'', groupId: subParts[2]||'' };" +
+				"   };" +
 
-    def clear_history(self):
-        self.root.ids.msg_history_list.clear_widgets()
-        toast("Đã dọn dẹp tin nhắn.")
+				// Tìm tất cả [data-qid] rồi match với _targetId hoặc _convId
+				"   if (_targetId && _targetId.length > 4 && !_targetId.startsWith('TIME_') && !_targetId.startsWith('VIRTUAL_')) {" +
+				"       var qframes = document.querySelectorAll('[data-qid]');" +
+				"       for (var qi=0; qi<qframes.length; qi++) {" +
+				"           var qp = _parseQid(qframes[qi]);" +
+				"           if (qp && qp.msgId === _targetId) { node = qframes[qi]; break; }" +
+				// Fallback: includes check
+				"           if (!node && (qframes[qi].getAttribute('data-qid')||'').includes(_targetId)) { node = qframes[qi]; break; }" +
+				"       }" +
+				"   }" +
 
-    def check_permissions_and_guide(self):
-        self.safe_toast("Bản cập nhật mới dùng API ngầm, không cần cấp quyền Trợ Năng nữa!")
+				// ── ƯU TIÊN 1: message-frame_[convId] — ID thực của Zalo Web ────────
+				// Zalo Web dùng id="message-frame_[convId]" KHÔNG PHẢI bb_msg_id
+				"   if (!node && _convId && _convId.length > 3) {" +
+				"       node = document.querySelector('#message-frame_'+_convId)" +
+				"           || document.querySelector('[id=\"message-frame_'+_convId+'\"]');" +
+				// Nếu có nhiều tin trong nhóm, lấy tin CUỐI CÙNG của convId đó
+				"       if (!node) {" +
+				"           var mframes = document.querySelectorAll('[id^=\"message-frame_\"]');" +
+				"           for (var mfi=mframes.length-1; mfi>=0; mfi--) {" +
+				"               if (mframes[mfi].id === 'message-frame_'+_convId) { node=mframes[mfi]; break; }" +
+				"           }" +
+				"       }" +
+				"   }" +
 
-    
+				// ── ƯU TIÊN 2: text-mCntr_[senderId]-[convId]-[msgId]-[groupId] ─────
+				// Format id: "text-mCntr_senderId-convId-msgId-groupId"
+				"   if (!node && _targetId && _targetId.length > 4) {" +
+				"       var mCntrs = document.querySelectorAll('[id^=\"text-mCntr_\"]');" +
+				"       for (var tci=0; tci<mCntrs.length; tci++) {" +
+				"           if ((mCntrs[tci].id||'').includes(_targetId)) { node = mCntrs[tci].closest('[data-qid],[id^=\"message-frame_\"]') || mCntrs[tci]; break; }" +
+				"       }" +
+				"   }" +
 
-    def show_update_popup(self, server_ver, update_note, apk_url):
-        """Hiện popup cập nhật - responsive theo màn hình, đồng bộ style app"""
-        # ScrollView bọc ngoài để máy nhỏ vẫn vuốt được
-        root_scroll = ScrollView(size_hint=(1, 1), do_scroll_x=False)
+				// ── ƯU TIÊN 3: Tin THOẠI — tìm theo class audio/voice ───────────────
+				"   if (!node && isVoice) {" +
+				"       var voiceBubbles = document.querySelectorAll('[class*=audio],[class*=voice-msg],[class*=VoiceMsg],[class*=AudioMessage],[class*=v-audio],.icon-voice,.ico-voice');" +
+				"       if (voiceBubbles.length > 0) {" +
+				"           node = voiceBubbles[voiceBubbles.length-1];" +
+				"           var vc = node.closest('[data-qid],[id^=\"message-frame_\"],[id^=msg_],[id^=msg-],[data-msg-id],.chat-bubble,.message-bubble,[class*=chat-message]');" +
+				"           if (vc) node = vc;" +
+				"       }" +
+				"       if (!node) {" +
+				"           var allItems = document.querySelectorAll('[id^=\"message-frame_\"],[data-qid],[id^=msg_],[id^=msg-],.chat-bubble,.chat-item');" +
+				"           for (var vi=allItems.length-1; vi>=0; vi--) {" +
+				"               var vhtml=(allItems[vi].innerHTML||'').toLowerCase();" +
+				"               if (vhtml.includes('ico-voice')||vhtml.includes('v-audio')||vhtml.includes('fa-playcircle')||vhtml.includes('audio-time')||vhtml.includes('audio-duration')) { node=allItems[vi]; break; }" +
+				"           }" +
+				"       }" +
+				"   }" +
 
-        main_layout = BoxLayout(
-            orientation='vertical',
-            padding=dp(15), spacing=dp(12),
-            size_hint_y=None
-        )
-        main_layout.bind(minimum_height=main_layout.setter('height'))
+				// ── ƯU TIÊN 4: Tin TEXT — tìm theo nội dung _search ─────────────────
+				"   if (!node && !isVoice && _search && _search.length > 2) {" +
+				"       var allMsgs = document.querySelectorAll('[data-qid],[id^=\"message-frame_\"],[id^=msg_],[id^=msg-],.chat-bubble,.chat-item');" +
+				"       for (var smi=allMsgs.length-1; smi>=0; smi--) {" +
+				"           if ((allMsgs[smi].innerText||allMsgs[smi].textContent||'').includes(_search)) { node=allMsgs[smi]; break; }" +
+				"       }" +
+				"   }" +
 
-        # --- TIÊU ĐỀ PHIÊN BẢN ---
-        main_layout.add_widget(Label(
-            text=f"[b]Phiên bản mới: v{server_ver}[/b]",
-            markup=True, halign='center', valign='middle',
-            color=(0.1, 0.1, 0.1, 1), bold=True,
-            size_hint_y=None, height=dp(35)
-        ))
+				// ── FALLBACK: tin cuối cùng trong chat ──────────────────────────────
+				"   if (!node) {" +
+				"       var lasts = document.querySelectorAll('[data-qid],[id^=\"message-frame_\"],[id^=msg_],[id^=msg-],.chat-bubble,.chat-item');" +
+				"       if (lasts.length > 0) node = lasts[lasts.length-1];" +
+				"   }" +
 
-        # --- NỘI DUNG GHI CHÚ CẬP NHẬT (tự co giãn theo text) ---
-        note_lbl = Label(
-            text=update_note,
-            halign='center', valign='top',
-            color=(0.3, 0.3, 0.3, 1),
-            size_hint_y=None,
-            text_size=(Window.width * 0.80, None)
-        )
-        note_lbl.bind(texture_size=lambda inst, val: setattr(inst, 'height', val[1] + dp(10)))
-        main_layout.add_widget(note_lbl)
+				"   return node;" +
+				"}" +
 
-        # --- LABEL TIẾN TRÌNH TẢI ---
-        self._update_progress_label = Label(
-            text="",
-            size_hint_y=None, height=dp(28),
-            color=(0.1, 0.5, 0.8, 1),
-            halign='center', valign='middle'
-        )
-        main_layout.add_widget(self._update_progress_label)
+                // ─────────────────────────────────────────────────────────────
+                // BƯỚC 3: TRÍCH XUẤT REACT OBJECT + REAL ID TỪ FIBER
+                // (GIỮ NGUYÊN TẦNG 0 + FIBER ĐI NGƯỢC 10 TẦNG + QUÉT CON)
+                // ─────────────────────────────────────────────────────────────
+                "function _extractObj(node) {" +
+				"   var res = {id: _targetId, obj: null};" +
+				"   if (!node) return res;" +
 
-        # --- NÚT CẬP NHẬT NGAY (xanh, đồng bộ style app) ---
-        btn_update = Button(
-            text="⬇  CẬP NHẬT NGAY",
-            size_hint_x=1, size_hint_y=None, height=dp(50),
-            bold=True, font_size='16sp',
-            background_normal='', background_color=(0.1, 0.5, 0.8, 1),
-            color=(1, 1, 1, 1)
-        )
+				// ── TẦNG 0A: Cache lookup ───────
+				"   if (_targetId && _targetId.length>4 && !_targetId.startsWith('TIME_') && !_targetId.startsWith('VIRTUAL_')) {" +
+				"       var cached = window._zauto_msg_cache && window._zauto_msg_cache[_targetId];" +
+				"       if (cached) { res.id=cached.globalMsgId||cached.msgId||_targetId; res.obj=cached; return res; }" +
+				"   }" +
 
-        # --- NÚT BỎ QUA ---
-        btn_skip = Button(
-            text="Bỏ qua lần này",
-            size_hint_x=1, size_hint_y=None, height=dp(42),
-            background_normal='', background_color=(0.65, 0.65, 0.65, 1),
-            color=(1, 1, 1, 1)
-        )
+				// ── TẦNG 0B: Parse data-qid trực tiếp ─────────────
+				"   var qEl = (node && node.getAttribute && node.getAttribute('data-qid')) ? node :" +
+				"             (node && node.closest('[data-qid]')) || (node && node.querySelector('[data-qid]'));" +
+				"   var qidRaw = qEl && qEl.getAttribute && qEl.getAttribute('data-qid');" +
+				"   if (qidRaw) {" +
+				"       var atIdx = qidRaw.indexOf('@');" +
+				"       var senderId = atIdx >= 0 ? qidRaw.substring(0, atIdx) : '';" +
+				"       var afterAt  = atIdx >= 0 ? qidRaw.substring(atIdx+1) : qidRaw;" +
+				"       var qParts   = afterAt.split('_');" +
+				"       var qConvId  = qParts[0] || _convId;" +
+				"       var qMsgId   = qParts[1] || '';" +
+				"       var qGroupId = qParts[2] || '';" +
+				"       if (qMsgId && qMsgId.length > 4) {" +
+				"           res.id = qMsgId;" +
+				"           var textEl = node && (" +
+				"               node.querySelector('[data-component=\"text-container\"] .text') ||" +
+				"               node.querySelector('[data-component=\"text-container\"] span') ||" +
+				"               node.querySelector('.text-message__container span.text') ||" +
+				"               node.querySelector('[class*=text-message] span') ||" +
+				"               node.querySelector('span.text')" +
+				"           );" +
+				"           var msgText = textEl ? textEl.textContent.trim() : _search;" +
+				"           res.obj = {" +
+				"               globalMsgId : qMsgId," +
+				"               msgId       : qMsgId," +
+				"               cliMsgId    : qMsgId," +
+				"               ownerId     : senderId," +
+				"               senderId    : senderId," +
+				"               uid         : senderId," +
+				"               convId      : qConvId," +
+				"               groupId     : qGroupId," +
+				"               msg         : msgText," +
+				"               content     : msgText," +
+				"               text        : msgText," +
+				"               type        : 1" +
+				"           };" +
+				"           if (window._zauto_msg_cache) window._zauto_msg_cache[qMsgId] = res.obj;" +
+				"           return res;" +
+				"       }" +
+				"   }" +
 
-        main_layout.add_widget(btn_update)
-        main_layout.add_widget(btn_skip)
-        # Khoảng đệm cuối tránh nút sát mép
-        main_layout.add_widget(Label(size_hint_y=None, height=dp(8)))
+				// Đi ngược 10 tầng fiber.return
+				"   var rk=Object.keys(node).find(k=>k.startsWith('__reactFiber')||k.startsWith('__reactProps'));" +
+                "   if (rk && node[rk]) {" +
+                "       var fn=node[rk]; var step=0;" +
+                "       while(fn && step<10) {" +
+                "           var p=fn.memoizedProps||fn.pendingProps;" +
+                "           if (p) {" +
+                "               var o=p.msg||p.message||p.data||p.item||p.msgData||p.msgInfo||p.messageData||p.payload||p.params;" +
+                "               if (o&&typeof o==='object'&&(o.msgId||o.globalMsgId||o.cliMsgId)) {" +
+                "                   res.id=String(o.msgId||o.globalMsgId||o.cliMsgId); res.obj=o; return res;" +
+                "               }" +
+                "           }" +
+                "           fn=fn.return; step++;" +
+                "       }" +
+                "   }" +
+                // Quét xuống các con
+                "   var ch=node.querySelectorAll('*');" +
+                "   for (var i=0;i<ch.length;i++) {" +
+                "       var ck=Object.keys(ch[i]).find(k=>k.startsWith('__reactFiber')||k.startsWith('__reactProps'));" +
+                "       if (ck&&ch[i][ck]) {" +
+                "           var cp=ch[i][ck].memoizedProps||ch[i][ck].pendingProps||{};" +
+                "           var co=cp.msg||cp.message||cp.data||cp.item||cp.msgData||cp.msgInfo||cp.messageData||cp.payload||cp.params;" +
+                "           if (co&&typeof co==='object') {" +
+                "               var cid=String(co.msgId||co.globalMsgId||co.cliMsgId||'');" +
+                "               if (cid&&cid.length>4){res.id=cid;res.obj=co;return res;}" +
+                "           }" +
+                "       }" +
+                "   }" +
+                // Tầng 0: React Conversation Store (giữ nguyên từ bản cũ)
+                "   if (_targetId&&_targetId.length>3&&!_targetId.startsWith('TIME_')) {" +
+                "       try {" +
+                "           var roots=[document.getElementById('app'),document.querySelector('#main-app'),document.querySelector('[class*=chat-window]'),document.querySelector('[class*=conversation]')].filter(Boolean);" +
+                "           outer: for (var ri=0;ri<roots.length;ri++) {" +
+                "               var rrk=Object.keys(roots[ri]).find(k=>k.startsWith('__reactFiber'));" +
+                "               if (!rrk) continue;" +
+                "               var nd=roots[ri][rrk]; var depth=0;" +
+                "               while(nd&&depth<80){" +
+                "                   var ms=nd.memoizedState;" +
+                "                   if (ms){var arr=ms.memoizedState||ms.queue; if(Array.isArray(arr)){for(var mi=0;mi<arr.length;mi++){var mm=arr[mi]; if(mm&&typeof mm==='object'){var fid=String(mm.msgId||mm.globalMsgId||mm.cliMsgId||''); if(fid===_targetId||fid===res.id){res.id=fid;res.obj=mm;break outer;}}}}}" +
+                "                   nd=nd.child||nd.sibling||(nd.return?nd.return.sibling:null); depth++;" +
+                "               }" +
+                "           }" +
+                "       } catch(e) {}" +
+                "   }" +
+                "   if (res.id&&res.id.length>4) res.id=res.id.replace('msg-','').replace('msg_','');" +
+				// ── TẦNG EXTRA MỚI THÊM VÀO ĐÂY ──
+				"   if (!res.obj || !res.id || res.id.length < 5) {" +
+				"       var qnode = node.closest('[data-qid]') || node.querySelector('[data-qid]') || node;" +
+				"       var qid = qnode ? qnode.getAttribute('data-qid') : null;" +
+				"       if (qid) {" +
+				"           var parts = qid.split('_');" +
+				"           if (parts.length >= 2) {" +
+				"               var rawMsgId = parts[1];" +
+				"               var senderPart = parts[0].split('@');" +
+				"               var senderId = senderPart[0]||'';" +
+				"               var convIdFromQid = senderPart[1]||_convId;" +
+				"               if (rawMsgId && rawMsgId.length > 4) {" +
+				"                   res.id = rawMsgId;" +
+				"                   if (!res.obj) res.obj = {" +
+				"                       globalMsgId: rawMsgId," +
+				"                       msgId: rawMsgId," +
+				"                       ownerId: senderId," +
+				"                       senderId: senderId," +
+				"                       cliMsgId: rawMsgId," +
+				"                       msg: node ? (node.innerText||node.textContent||'').trim().substring(0,200) : _search," +
+				"                       type: 1" +
+				"                   };" +
+				"               }" +
+				"           }" +
+				"       }" +
+				"   }" +
+				// ── KẾT THÚC TẦNG EXTRA ──
+				"   return res;" +
+				"}" +
 
-        root_scroll.add_widget(main_layout)
+                // ─────────────────────────────────────────────────────────────
+                // BƯỚC 4: ĐIỀN TEXT + GỬI (GIỮ NGUYÊN SELECTOR ĐẦY ĐỦ)
+                // ─────────────────────────────────────────────────────────────
+                "function _typeAndSend() {" +
+				// Ẩn bàn phím TRƯỚC MỌI THỨ: blur element đang focus, body.focus() chặn Android IME
+				"   try { var _ae=document.activeElement; if(_ae&&_ae!==document.body){_ae.blur();} document.body.focus(); } catch(e) {}" +
+				"   var input = document.querySelector('#chat-input-content')" +
+				"            || document.querySelector('#richInput')" +
+				"            || document.querySelector('[contenteditable=true][class*=chat-input]')" +
+				"            || document.querySelector('[contenteditable=true][data-lexical-editor]')" +
+				"            || document.querySelector('[contenteditable=true][role=textbox]')" +
+				"            || document.querySelector('[contenteditable=true]')" +
+				"            || document.querySelector('.chat-input');" +
+				"   if (!input) { ZAutoBridge.onLoginSuccess('TRIGGER_VISION_FALLBACK',''); return; }" +
+				"   input.setAttribute('readonly','true');" +
+				"   input.focus();" +
+				"   input.removeAttribute('readonly');" +
+				// Xóa toàn bộ text cũ bằng selectAll trước
+				"   try { document.execCommand('selectAll',false,null); document.execCommand('delete',false,null); } catch(ex) {}" +
+				"   input.innerHTML = '';" +
+				// Ghi text mới
+				"   try { document.execCommand('insertText',false,_reply); } catch(ex) {}" +
+				// Fallback nếu execCommand không hoạt động
+				"   if (!input.textContent.trim() || input.textContent.trim() !== _reply) {" +
+				"       input.innerHTML = '';" +
+				"       input.textContent = _reply;" +
+				// Trigger React bằng cách set value qua native setter
+				"       var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLElement.prototype,'innerHTML') || Object.getOwnPropertyDescriptor(window.Element.prototype,'innerHTML');" +
+				"       if (nativeInputValueSetter && nativeInputValueSetter.set) { nativeInputValueSetter.set.call(input, _reply); }" +
+				"   }" +
+                "   input.dispatchEvent(new Event('input',{bubbles:true}));" +
+				"   input.dispatchEvent(new Event('change',{bubbles:true}));" +
+				// Tầng 1: blur sau khi điền
+				"   input.blur();" +
+				"   document.body.focus();" +
+				"   setTimeout(function() {" +
+				// Tầng 2: blur trước khi click gửi
+				"       try { var _ae2=document.activeElement; if(_ae2&&_ae2!==document.body){_ae2.blur();} } catch(e){}" +
+				"       var iSend = document.querySelector('i.fa.fa-Sent-msg_24_Line')" +
+				"                || document.querySelector('.fa-Sent-msg_24_Line')" +
+				"                || document.querySelector('[class*=Sent-msg_24_Line]');" +
+				"       var btnSend = iSend ? (iSend.closest('.z--btn--v2')||iSend.closest('button')||iSend.parentNode) : null;" +
+				"       if (!btnSend) btnSend = document.querySelector('#chat-input-container-id .send-msg-btn')" +
+				"                           || document.querySelector('[data-translate-title=STR_SEND]');" +
+				"       if (btnSend) {" +
+				"           btnSend.click();" +
+				"           btnSend.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true}));" +
+				"       }" +
+				"       input.dispatchEvent(new KeyboardEvent('keydown',{bubbles:true,cancelable:true,keyCode:13,key:'Enter',which:13}));" +
+				"       input.dispatchEvent(new KeyboardEvent('keypress',{bubbles:true,cancelable:true,keyCode:13,key:'Enter',which:13}));" +
+				"       input.dispatchEvent(new KeyboardEvent('keyup',{bubbles:true,cancelable:true,keyCode:13,key:'Enter',which:13}));" +
+				// Tầng 3: readonly lock + blur + body.focus sau Enter
+				"       input.setAttribute('readonly','true');" +
+				"       input.blur();" +
+				"       document.body.focus();" +
+				"       setTimeout(function(){" +
+				"           input.removeAttribute('readonly');" +
+				"           var chk=document.querySelector('#chat-input-content,#richInput,[contenteditable=true]');" +
+				"           var ok=!chk||chk.innerHTML===''||chk.innerHTML==='<br>'||chk.textContent.trim()==='';" +
+				"           ZAutoBridge.onLoginSuccess(ok?'Chốt DOM UI QUOTE OK':'TRIGGER_VISION_FALLBACK','');" +
+				"       },500);" +
+				"   },400);" +
+                "}" +
 
-        self._update_popup = Popup(
-            title="🆕 Có bản cập nhật mới!",
-            content=root_scroll,
-            size_hint=(0.92, 0.55),   # 92% rộng, 55% cao màn hình -> vừa mọi máy
-            auto_dismiss=False,
-            background='',
-            background_color=(1, 1, 1, 1),
-            title_color=(0, 0, 0, 1),
-            separator_color=(0.1, 0.5, 0.8, 1)
-        )
-        btn_update.bind(on_release=lambda x: self._start_download_apk(apk_url))
-        btn_skip.bind(on_release=self._update_popup.dismiss)
-        self._update_popup.open()
+                // ─────────────────────────────────────────────────────────────
+                // BƯỚC 5: KIỂM TRA QUOTE BANNER HIỆN RA
+                // ─────────────────────────────────────────────────────────────
+                "function _waitBanner(cb, maxMs) {" +
+                "   var t0=Date.now();" +
+                "   var iv=setInterval(function(){" +
+                "       var b=document.querySelector('.chat-box-input__heading .quote-banner')" +
+                "           ||document.querySelector('.rel.quote-banner')" +
+                "           ||document.querySelector('[class*=quote-banner]')" +
+                "           ||document.querySelector('[class*=reply-banner]')" +
+                "           ||document.querySelector('[class*=ReplyBanner]')" +
+                "           ||document.querySelector('[class*=quote-msg]')" +
+                "           ||document.querySelector('[class*=QuoteMsg]');" +
+                "       if (b||Date.now()-t0>maxMs){clearInterval(iv);cb(!!b);}" +
+                "   },80);" +
+                "}" +
 
-    def _start_download_apk(self, apk_url):
-        # Đã đưa các import lên đầu file thì ở đây không cần nữa
-        # Lưu vào cache thư mục ngoài để FileProvider có thể đọc được
-        if platform == 'android':
-            try:
-                ctx = PythonActivity.mActivity
-                save_path = os.path.join(ctx.getExternalCacheDir().getAbsolutePath(), 'update.apk')
-            except:
-                save_path = os.path.join(BASE_PATH, 'update.apk')
-        else:
-            save_path = os.path.join(BASE_PATH, 'update.apk')
-        try:
-            if os.path.exists(save_path):
-                os.remove(save_path)
-        except: 
-            pass
+                // ─────────────────────────────────────────────────────────────
+				// BƯỚC 6B: LONG PRESS — phương án phòng bị mở popup Zalo
+				// ─────────────────────────────────────────────────────────────
+				"function _longPress(node, doneCb) {" +
+				"   if (!node) { doneCb(false); return; }" +
+				"   node.scrollIntoView({block:'center', behavior:'instant'});" +
+				"   setTimeout(function() {" +
+				// Tìm element con nhỏ nhất có nội dung thật — ưu tiên audio container, sau đó text bubble
+				"       var bubble = node.querySelector('[class*=audio],[class*=voice-msg],[class*=VoiceMsg],[class*=v-audio],.ico-voice,.icon-voice')" +
+				"                 || node.querySelector('.card--text,.card-content,[class*=bubble],[class*=chat-item__content],.message-chat-inner,[class*=msg-content],[class*=message-content]')" +
+				"                 || node.querySelector('span[class],p[class],div[class*=text]')" +
+				"                 || node;" +
+				// Nếu bubble vẫn là node cha (không tìm được con) → đi xuống tìm con có kích thước nhỏ hơn
+				"       if (bubble === node && node.children.length > 0) {" +
+				"           var smallest = node; var smallestArea = node.offsetWidth * node.offsetHeight;" +
+				"           var allChildren = node.querySelectorAll('*');" +
+				"           for (var ci=0; ci<allChildren.length; ci++) {" +
+				"               var ch = allChildren[ci];" +
+				"               var area = ch.offsetWidth * ch.offsetHeight;" +
+				"               if (area > 100 && area < smallestArea) { smallest = ch; smallestArea = area; }" +
+				"           }" +
+				"           if (smallest !== node) bubble = smallest;" +
+				"       }" +
+				"       var rect = bubble.getBoundingClientRect();" +
+				"       var vw = window.innerWidth||document.documentElement.clientWidth;" +
+				"       var vh = window.innerHeight||document.documentElement.clientHeight;" +
+				"       if (rect.top < 0 || rect.bottom > vh || rect.height === 0) {" +
+				"           node.scrollIntoView({block:'center', behavior:'smooth'});" +
+				"           rect = bubble.getBoundingClientRect();" +
+				"       }" +
+				"       var cx = Math.max(10, Math.min(rect.left + rect.width/2, vw-10));" +
+				"       var cy = Math.max(10, Math.min(rect.top  + rect.height/2, vh-10));" +
+				"       var probes = [bubble, node];" +
+				"       var triggered = false;" +
+				"       for (var i=0;i<probes.length;i++) {" +
+				"           var rk=Object.keys(probes[i]).find(k=>k.startsWith('__reactEventHandlers')||k.startsWith('__reactFiber'));" +
+				"           if (rk&&probes[i][rk]) {" +
+				"               var fib=probes[i][rk];" +
+				"               var lp = (fib.memoizedProps&&(fib.memoizedProps.onLongPress||fib.memoizedProps.onContextMenu))" +
+				"                     || (fib.return&&fib.return.memoizedProps&&(fib.return.memoizedProps.onLongPress||fib.return.memoizedProps.onContextMenu));" +
+				"               if (typeof lp==='function') {" +
+				"                   try { lp({preventDefault:function(){},stopPropagation:function(){},bubbles:true,clientX:cx,clientY:cy}); triggered=true; break; }" +
+				"                   catch(ex) {}" +
+				"               }" +
+				"           }" +
+				"       }" +
+				"       try {" +
+				"           bubble.dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true,view:window,clientX:cx,clientY:cy,button:2}));" +
+				"       } catch(e) {}" +
+				"       try {" +
+				"           var mkT=function(id,el){try{return new Touch({identifier:id,target:el,clientX:cx,clientY:cy,radiusX:5,radiusY:5,rotationAngle:0,force:1});}catch(e){return null;}};" +
+				"           var tLp=mkT(201,bubble);" +
+				"           if(tLp) {" +
+				"               bubble.dispatchEvent(new TouchEvent('touchstart',{bubbles:true,cancelable:true,touches:[tLp],targetTouches:[tLp],changedTouches:[tLp]}));" +
+				"               setTimeout(function(){" +
+				"                   bubble.dispatchEvent(new TouchEvent('touchend',{bubbles:true,cancelable:true,touches:[],targetTouches:[],changedTouches:[tLp]}));" +
+				"               }, 650);" +
+				"           }" +
+				"       } catch(te) {}" +
 
-        def download_thread():
-            try:
-                Clock.schedule_once(lambda dt: setattr(
-                    self._update_progress_label, 'text', "Đang kết nối..."), 0)
+				"       // Đợi 750ms cho popup Zalo animate xong → tìm click 'Trả lời'" +
+				"       setTimeout(function() {" +
+				"           var replyBtn = null;" +
+				"           // Tìm trong context-menu / popup đang hiện" +
+				"           var menuItems = document.querySelectorAll('[class*=context-menu] [class*=item],[class*=popup] [class*=item],[class*=menu] li,[role=menuitem],li');" +
+				"           for (var mi=0; mi<menuItems.length; mi++) {" +
+				"               var mt = (menuItems[mi].textContent||'').trim();" +
+				"               if (mt==='Trả lời'||mt==='Reply') { replyBtn=menuItems[mi]; break; }" +
+				"           }" +
+				"           // Fallback: quét toàn DOM — chỉ lấy element đang visible" +
+				"           if (!replyBtn) {" +
+				"               var allEls = document.querySelectorAll('span,div,li,button,a,p');" +
+				"               for (var ei=0; ei<allEls.length; ei++) {" +
+				"                   var et=(allEls[ei].textContent||'').trim();" +
+				"                   if ((et==='Trả lời'||et==='Reply') && allEls[ei].offsetParent!==null) {" +
+				"                       replyBtn=allEls[ei]; break;" +
+				"                   }" +
+				"               }" +
+				"           }" +
+				"           if (replyBtn) {" +
+				"               replyBtn.dispatchEvent(new MouseEvent('mouseover',{bubbles:true}));" +
+				"               replyBtn.dispatchEvent(new MouseEvent('mousedown',{bubbles:true,cancelable:true}));" +
+				"               replyBtn.dispatchEvent(new MouseEvent('mouseup',{bubbles:true,cancelable:true}));" +
+				"               replyBtn.click();" +
+				"               triggered=true;" +
+				"           }" +
+				"           doneCb(triggered);" +
+				"       }, 750);" +
 
-                opener = urllib.request.build_opener(urllib.request.HTTPRedirectHandler())
-                opener.addheaders = [('User-Agent', 'Mozilla/5.0')]
-                urllib.request.install_opener(opener)
+				"   }, 300);" +
+				"}" +
+				"function _doSend(node, realId, reactObj) {" +
+				"   _discoverApi();" +
+				"   var _sendFn = window.zMessenger && (" +
+				"       window.zMessenger.sendMessage ||" +
+				"       window.zMessenger.sendQuoteMsg ||" +
+				"       window.zMessenger.replyMessage ||" +
+				"       window.zMessenger.sendTextMessage ||" +
+				"       window.zMessenger.sendMsg" +
+				"   );" +
+				"   if (typeof _sendFn === 'function') {" +
+				"       try {" +
+				"           var req = {toid:_convId, msg:_reply, type:1};" +
+				"           var validId = realId && realId.length>4 && !realId.startsWith('TIME_') && !realId.startsWith('VIRTUAL_') && !realId.startsWith('CONTENT_') && !realId.startsWith('CACHE_');" +
+				"           if (validId) {" +
+				"               req.quote = reactObj ? {" +
+				"                   globalMsgId: realId," +
+				"                   ownerId: reactObj.ownerId||reactObj.senderId||reactObj.uid||''," +
+				"                   dName:   reactObj.dName||reactObj.senderName||reactObj.fromName||''," +
+				"                   msg:     reactObj.content||reactObj.msg||reactObj.text||_search," +
+				"                   type:    reactObj.msgType||reactObj.type||1" +
+				"               } : {globalMsgId:realId, msg:_search, type:1};" +
+				"           }" +
+				"           _sendFn.call(window.zMessenger, req);" +
+				"           ZAutoBridge.onLoginSuccess('Chốt API QUOTE OK','');" +
+				"           return;" +
+				"       } catch(apiErr) { console.log('ZAuto API fail:', String(apiErr)); }" +
+				"   }" +
+				"   try {" +
+				"       _superDblClick(node, function(reactHandled) {" +
+				"           _waitBanner(function(bannerOk) {" +
+				"               if (bannerOk) {" +
+				"                   _typeAndSend();" +
+				"               } else {" +
+				"                   _longPress(node, function(lpTriggered) {" +
+				"                       _waitBanner(function(bannerOk2) {" +
+				"                           if (bannerOk2) {" +
+				"                               _typeAndSend();" +
+				"                           } else {" +
+				"                               var rb=null, els=document.querySelectorAll('span,div,li,button,a');" +
+				"                               for(var k=0;k<els.length;k++){" +
+				"                                   var kt=(els[k].textContent||'').trim();" +
+				"                                   if((kt==='Trả lời'||kt==='Reply')&&els[k].offsetParent!==null){rb=els[k];break;}" +
+				"                               }" +
+				"                               if(rb){ rb.click(); setTimeout(function(){_waitBanner(function(b3){_typeAndSend();},1000);},400); }" +
+				"                               else { _typeAndSend(); }" +
+				"                           }" +
+				"                       }, 1800);" +
+				"                   });" +
+				"               }" +
+				"           }, 1800);" +
+				"       });" +
+				"   } catch(domErr) {" +
+				"       ZAutoBridge.onLoginSuccess('TRIGGER_VISION_FALLBACK','');" +
+				"   }" +
+				"}" +
+				"function _superDblClick(node, doneCb) {" +
+                "   if (!node) { doneCb(false); return; }" +
+                // Scroll đến tin, đợi render xong rồi mới đo tọa độ
+                "   node.scrollIntoView({block:'center', behavior:'instant'});" +
+                "   setTimeout(function() {" +
 
-                req = urllib.request.Request(apk_url, headers={'User-Agent': 'Mozilla/5.0'})
-                response = urllib.request.urlopen(req, timeout=120)
+                // Tìm bong bóng chính xác nhất
+                // Tìm element con nhỏ nhất có nội dung thật — ưu tiên audio container, sau đó text bubble
+				"       var bubble = node.querySelector('[class*=audio],[class*=voice-msg],[class*=VoiceMsg],[class*=v-audio],.ico-voice,.icon-voice')" +
+				"                 || node.querySelector('.card--text,.card-content,[class*=bubble],[class*=chat-item__content],.message-chat-inner,[class*=msg-content],[class*=message-content]')" +
+				"                 || node.querySelector('span[class],p[class],div[class*=text]')" +
+				"                 || node;" +
+				// Nếu bubble vẫn là node cha (không tìm được con) → đi xuống tìm con có kích thước nhỏ hơn
+				"       if (bubble === node && node.children.length > 0) {" +
+				"           var smallest = node; var smallestArea = node.offsetWidth * node.offsetHeight;" +
+				"           var allChildren = node.querySelectorAll('*');" +
+				"           for (var ci=0; ci<allChildren.length; ci++) {" +
+				"               var ch = allChildren[ci];" +
+				"               var area = ch.offsetWidth * ch.offsetHeight;" +
+				"               if (area > 100 && area < smallestArea) { smallest = ch; smallestArea = area; }" +
+				"           }" +
+				"           if (smallest !== node) bubble = smallest;" +
+				"       }" +
+                "       var rect = bubble.getBoundingClientRect();" +
+                "       var vw = window.innerWidth||document.documentElement.clientWidth;" +
+                "       var vh = window.innerHeight||document.documentElement.clientHeight;" +
 
-                total_size = int(response.headers.get('Content-Length', 0))
-                downloaded = 0
+                // Nếu bubble chưa vào viewport — scroll thêm lần nữa
+                "       if (rect.top < 0 || rect.bottom > vh || rect.height === 0) {" +
+                "           node.scrollIntoView({block:'center', behavior:'smooth'});" +
+                "           rect = bubble.getBoundingClientRect();" +
+                "       }" +
 
-                Clock.schedule_once(lambda dt: setattr(
-                    self._update_progress_label, 'text', "Đang tải... 0%"), 0)
+				// Double-click đúng chuẩn Zalo: click vào VÙNG TRỐNG trong hàng tin nhắn (bên ngoài bubble text)
+				// Theo cấu trúc HTML: .message-frame là row toàn bộ, bubble là .text-message__container bên trong
+				"       var row = node.closest('.message-frame,.message-container,[class*=message-row],[class*=chat-item],[class*=MessageItem]') || node;" +
+				"       var rowRect = row.getBoundingClientRect();" +
+				"       var bubbleRect = bubble.getBoundingClientRect();" +
+				"       var cy = Math.max(10, Math.min(rowRect.top + rowRect.height/2, vh-10));" +
+				"       var cx;" +
+				// Kiểm tra vùng trống BÊN PHẢI bubble trong row
+				"       if (rowRect.right - bubbleRect.right > 30) {" +
+				"           cx = Math.min(bubbleRect.right + Math.floor((rowRect.right - bubbleRect.right)/2), vw-10);" +
+				// Kiểm tra vùng trống BÊN TRÁI bubble trong row
+				"       } else if (bubbleRect.left - rowRect.left > 30) {" +
+				"           cx = Math.max(10, rowRect.left + Math.floor((bubbleRect.left - rowRect.left)/2));" +
+				// Fallback: bubble chiếm gần hết row → click tâm bubble
+				"       } else {" +
+				"           cx = Math.max(10, Math.min(bubbleRect.left + bubbleRect.width/2, vw-10));" +
+				"       }" +
 
-                with open(save_path, 'wb') as f:
-                    while True:
-                        block = response.read(8192)
-                        if not block:
-                            break
-                        f.write(block)
-                        downloaded += len(block)
-                        if total_size > 0:
-                            percent = min(int(downloaded * 100 / total_size), 99)
-                            Clock.schedule_once(
-                                lambda dt, p=percent: setattr(
-                                    self._update_progress_label, 'text', f"Đang tải... {p}%"), 0)
+                "       var wrapper = node.closest('.chat-message,.message-container,[class*=message-row],[class*=chat-item],[class*=MessageItem]') || node;" +
+                "       var triggered = false;" +
 
-                file_size = os.path.getsize(save_path)
-                if file_size < 500 * 1024:  # hạ ngưỡng xuống 500KB
-                    raise Exception(f"File quá nhỏ ({file_size} bytes) - tải thất bại")
+                // ── CHIẾN LƯỢC A: Chọc thẳng React onDoubleClick handler ──────
+                // Không cần tọa độ — mạnh nhất, không phụ thuộc layout
+                "       var probes = [bubble, node, wrapper];" +
+                "       try { var extra=node.querySelectorAll('[class*=chat-message],[class*=message-row],[class*=MessageItem]'); for(var pi=0;pi<Math.min(extra.length,5);pi++) probes.push(extra[pi]); } catch(ex) {}" +
+                "       for (var i=0;i<probes.length;i++) {" +
+                "           if (!probes[i]) continue;" +
+                "           var rk=Object.keys(probes[i]).find(k=>k.startsWith('__reactEventHandlers')||k.startsWith('__reactFiber'));" +
+                "           if (rk&&probes[i][rk]) {" +
+                "               var fib=probes[i][rk];" +
+                // Tìm handler onDoubleClick qua nhiều đường fiber
+                "               var dbl = fib.onDoubleClick" +
+                "                       ||(fib.memoizedProps&&fib.memoizedProps.onDoubleClick)" +
+                "                       ||(fib.pendingProps&&fib.pendingProps.onDoubleClick)" +
+                "                       ||(fib.return&&fib.return.memoizedProps&&fib.return.memoizedProps.onDoubleClick)" +
+                "                       ||(fib.return&&fib.return.return&&fib.return.return.memoizedProps&&fib.return.return.memoizedProps.onDoubleClick);" +
+                "               if (typeof dbl==='function') {" +
+                "                   try {" +
+                "                       dbl({preventDefault:function(){},stopPropagation:function(){},bubbles:true,clientX:cx,clientY:cy,nativeEvent:{clientX:cx,clientY:cy}});" +
+                "                       triggered=true; break;" +
+                "                   } catch(ex2) {}" +
+                "               }" +
+                "           }" +
+                "       }" +
 
-                Clock.schedule_once(lambda dt: setattr(
-                    self._update_progress_label, 'text', "✅ Tải xong! Đang mở cài đặt..."), 0)
-                Clock.schedule_once(lambda dt: self._install_apk(save_path), 1.0)
+                // ── CHIẾN LƯỢC B: Chuỗi Mouse Events đầy đủ vào TÂM bubble ──
+                // mousedown×2 → mouseup×2 → click(detail:1) → click(detail:2) → dblclick
+                // Mô phỏng chính xác hành vi người dùng thật trên Chromium
+                "       var fireMouseSeq = function(el) {" +
+                "           el.dispatchEvent(new MouseEvent('mouseover',{bubbles:true,cancelable:true,view:window,clientX:cx,clientY:cy}));" +
+                "           el.dispatchEvent(new MouseEvent('mousemove',{bubbles:true,cancelable:true,view:window,clientX:cx,clientY:cy}));" +
+                "           el.dispatchEvent(new MouseEvent('mousedown',{bubbles:true,cancelable:true,view:window,clientX:cx,clientY:cy,buttons:1,detail:1}));" +
+                "           el.dispatchEvent(new MouseEvent('mouseup',  {bubbles:true,cancelable:true,view:window,clientX:cx,clientY:cy,buttons:0,detail:1}));" +
+                "           el.dispatchEvent(new MouseEvent('click',    {bubbles:true,cancelable:true,view:window,clientX:cx,clientY:cy,buttons:0,detail:1}));" +
+                "           setTimeout(function(){" +
+                "               el.dispatchEvent(new MouseEvent('mousedown',{bubbles:true,cancelable:true,view:window,clientX:cx,clientY:cy,buttons:1,detail:2}));" +
+                "               el.dispatchEvent(new MouseEvent('mouseup',  {bubbles:true,cancelable:true,view:window,clientX:cx,clientY:cy,buttons:0,detail:2}));" +
+                "               el.dispatchEvent(new MouseEvent('click',    {bubbles:true,cancelable:true,view:window,clientX:cx,clientY:cy,buttons:0,detail:2}));" +
+                "               el.dispatchEvent(new MouseEvent('dblclick', {bubbles:true,cancelable:true,view:window,clientX:cx,clientY:cy,buttons:0,detail:2}));" +
+                "           }, 60);" +
+                "       };" +
+                // Bắn vào row tại tọa độ vùng trống đã tính (cx,cy) — đây là cách Zalo Web nhận double-click reply
+				"       fireMouseSeq(row);" +
+				"       setTimeout(function(){ fireMouseSeq(bubble); }, 30);" +
 
-            except Exception as e:
-                err_detail = traceback.format_exc()
-                logger.error(f"Lỗi tải APK:\n{err_detail}")
-                try:
-                    if os.path.exists(save_path):
-                        os.remove(save_path)
-                except: 
-                    pass
-                # Hiện lỗi chi tiết lên label
-                Clock.schedule_once(lambda dt: setattr(
-                    self._update_progress_label, 'text', f"❌ {str(e)[:120]}"), 0)
+                // ── CHIẾN LƯỢC C: Touch Events đôi (Android WebView native) ──
+                // Android đôi khi ưu tiên touch events hơn mouse events
+                "       try {" +
+                "           var mkTouch=function(id,el){try{return new Touch({identifier:id,target:el,clientX:cx,clientY:cy,radiusX:5,radiusY:5,rotationAngle:0,force:1});}catch(e){return null;}};" +
+                "           var t1=mkTouch(101,bubble);" +
+                "           if (t1) {" +
+                "               bubble.dispatchEvent(new TouchEvent('touchstart',{bubbles:true,cancelable:true,touches:[t1],targetTouches:[t1],changedTouches:[t1]}));" +
+                "               bubble.dispatchEvent(new TouchEvent('touchend',  {bubbles:true,cancelable:true,touches:[],targetTouches:[],changedTouches:[t1]}));" +
+                "               setTimeout(function(){" +
+                "                   var t2=mkTouch(102,bubble);" +
+                "                   if (!t2) return;" +
+                "                   bubble.dispatchEvent(new TouchEvent('touchstart',{bubbles:true,cancelable:true,touches:[t2],targetTouches:[t2],changedTouches:[t2]}));" +
+                "                   bubble.dispatchEvent(new TouchEvent('touchend',  {bubbles:true,cancelable:true,touches:[],targetTouches:[],changedTouches:[t2]}));" +
+                "               }, 80);" +
+                "           }" +
+                "       } catch(tex) {}" +
 
-        # Khởi chạy luồng download
-        threading.Thread(target=download_thread, daemon=False).start()
+                // ── CHIẾN LƯỢC D: Pointer Events chuẩn W3C (Chrome 86+) ──────
+                "       try {" +
+                "           bubble.dispatchEvent(new PointerEvent('pointerover', {bubbles:true,clientX:cx,clientY:cy,pointerId:1,isPrimary:true,pointerType:'mouse'}));" +
+                "           bubble.dispatchEvent(new PointerEvent('pointerdown', {bubbles:true,clientX:cx,clientY:cy,pointerId:1,isPrimary:true,pointerType:'mouse',pressure:0.5}));" +
+                "           bubble.dispatchEvent(new PointerEvent('pointerup',   {bubbles:true,clientX:cx,clientY:cy,pointerId:1,isPrimary:true,pointerType:'mouse'}));" +
+                "           setTimeout(function(){" +
+                "               bubble.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,clientX:cx,clientY:cy,pointerId:1,isPrimary:true,pointerType:'mouse',pressure:0.5}));" +
+                "               bubble.dispatchEvent(new PointerEvent('pointerup',  {bubbles:true,clientX:cx,clientY:cy,pointerId:1,isPrimary:true,pointerType:'mouse'}));" +
+                "               bubble.dispatchEvent(new PointerEvent('click',      {bubbles:true,clientX:cx,clientY:cy,pointerId:1,isPrimary:true,pointerType:'mouse',detail:2}));" +
+                "           }, 80);" +
+                "       } catch(pex) {}" +
 
+                // Sau tất cả chiến lược — gọi callback
+                "       doneCb(triggered);" +
+                "   }, 300);" +   // đợi scroll render
+                "}" +
+				// ─────────────────────────────────────────────────────────────
+                // LUỒNG CHẠY CHÍNH (ĐÃ CẬP NHẬT GỌN GÀNG)
+                // ─────────────────────────────────────────────────────────────
+                "_openGroup(function(opened) {" +
+                "   var node    = _findNode();" +
+                "   var ext     = _extractObj(node);" +
+                "   if (!opened) {" +
+                "       console.log('ZAuto: group not opened, retry click convId='+_convId);" +
+                "       var directItem = document.querySelector('[anim-data-id=\"'+_convId+'\"]');" +
+                "       if (directItem) { directItem.click(); }" +
+                "       setTimeout(function() {" +
+                "           var n2=_findNode(); var e2=_extractObj(n2);" +
+                "           if (!n2) { ZAutoBridge.onLoginSuccess('TRIGGER_VISION_FALLBACK',''); return; }" +
+                "           _doSend(n2, e2.id, e2.obj);" +
+                "       }, 2000);" +
+                "       return;" +
+                "   }" +
+                "   _doSend(node, ext.id, ext.obj);" +
+                "});" +
 
-    def _install_apk(self, apk_path):
-        if platform != 'android':
-            toast(f"[PC] APK đã tải về: {apk_path}")
-            return
+                "} catch(e) { console.log('ZAuto fatal:',String(e)); ZAutoBridge.onLoginSuccess('TRIGGER_VISION_FALLBACK',''); }" +
+                "})();";
 
-        try:
-            from jnius import autoclass
-            File       = autoclass('java.io.File')
-            Intent     = autoclass('android.content.Intent')
-            Build      = autoclass('android.os.Build')
-            activity   = PythonActivity.mActivity
-            pkg        = activity.getPackageName()
-            apk_file   = File(apk_path)
+                // Tạm thời đưa WebView vào viewport để JS click/touch hoạt động
+                // (chỉ cần 1x1px visible là đủ — không cần full screen)
+                try {
+                    ViewGroup.LayoutParams lp = webLayout.getLayoutParams();
+                    if (lp instanceof FrameLayout.LayoutParams) {
+                        FrameLayout.LayoutParams flp = (FrameLayout.LayoutParams) lp;
+                        int oldLeft = flp.leftMargin;
+                        int oldTop  = flp.topMargin;
+                        flp.leftMargin = 0;
+                        flp.topMargin  = 0;
+                        webLayout.setLayoutParams(flp);
+                        webLayout.requestLayout();
+                        hiddenWebView.bringToFront();
+                        hiddenWebView.requestFocus();
 
-            if Build.VERSION.SDK_INT >= 24:
-                FileProvider = autoclass('androidx.core.content.FileProvider')
-                # Authority khớp chuẩn với buildozer p4a default
-                authority = f"{pkg}.fileprovider"
-                try:
-                    uri = FileProvider.getUriForFile(activity, authority, apk_file)
-                except Exception:
-                    uri = FileProvider.getUriForFile(activity, f"{pkg}.provider", apk_file)
-            else:
-                Uri = autoclass('android.net.Uri')
-                uri = Uri.fromFile(apk_file)
+                        // Chạy JS sau 150ms (đủ để Android layout xong)
+                        hiddenWebView.postDelayed(() -> {
+                            hiddenWebView.evaluateJavascript(jsCode, null);
+                            // Ẩn lại sau 8 giây (đủ cho toàn bộ flow click+send xong)
+                            hiddenWebView.postDelayed(() -> {
+                                try {
+                                    flp.leftMargin = oldLeft;
+                                    flp.topMargin  = oldTop;
+                                    webLayout.setLayoutParams(flp);
+                                    webLayout.requestLayout();
+                                } catch (Exception ignored) {}
+                            }, 8000);
+                        }, 150);
+                    } else {
+                        hiddenWebView.evaluateJavascript(jsCode, null);
+                    }
+                } catch (Exception layoutEx) {
+                    hiddenWebView.evaluateJavascript(jsCode, null);
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "Reply Engine Error", e);
+            }
+        }));
 
-            intent = Intent(Intent.ACTION_VIEW)
-            intent.setDataAndType(uri, "application/vnd.android.package-archive")
-            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        safeActivity.runOnUiThread(ZaloWebManager::processReplyQueue);
+    }
 
-            # Giữ Foreground Service sống trước khi nhường màn hình cho installer
-            try:
-                autoclass('org.zauto.ZaloForegroundService').startService(activity)
-            except: pass
+    // =========================================================
+    // JAVA BRIDGE → NÉM VÀO RAM PYTHON THAY VÌ BROADCAST
+    // =========================================================
+    public static String currentImei = ""; // Thêm dòng này ngay trên WebAppInterface
 
-            activity.startActivity(intent)
-            logger.info("Đã mở màn hình cài đặt APK")
+    public static class WebAppInterface {
+        Context mContext;
+        WebAppInterface(Context c) { mContext = c; }
 
-            Clock.schedule_once(lambda dt: self._update_popup.dismiss()
-                                if hasattr(self, '_update_popup') and self._update_popup else None, 1.5)
+        @JavascriptInterface
+        public void onHeartbeat(String ts, String imei) { // Thêm tham số imei
+            lastHeartbeat = System.currentTimeMillis();
+            if (imei != null && !imei.isEmpty() && !imei.equals("null")) {
+                currentImei = imei; // Lưu IMEI lại khi JS gửi lên
+            }
+        }
+        // ... (giữ nguyên các hàm bên dưới)
 
-        except Exception as e:
-            err = traceback.format_exc()
-            logger.error(f"Lỗi _install_apk:\n{err}")
-            # Hiện lỗi lên label thay vì toast rồi dismiss
-            Clock.schedule_once(lambda dt: setattr(
-                self._update_progress_label, 'text', f"❌ Cài đặt lỗi: {str(e)[:100]}"), 0)
-       
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.app_running = True
-        self.is_radar_running = False
-        self.enabled_groups = {}
-        self.webview_inited = False
-        self.webview_visible = False
-        self._webview_timer = None
-        self.last_webview_bounds = None
-        self.config_data = {}
-        self.is_linked = False
-        
-        # Tối ưu RAM: Giảm Cache xuống 300 chống Leak
-        self.processed_msg_hashes = LRUCache(maxsize=1000)
-        self.global_last_reply = 0
-        self.last_reply_time = LRUCache(maxsize=200)
-        
-        # QUEUE ĐA LUỒNG
-        self.msg_queue = queue.Queue(maxsize=500)
-        self.reply_queue = queue.Queue(maxsize=50)
-        self.ui_queue = queue.Queue(maxsize=100) # Queue chuyên đẩy UI update chống Freeze Kivy
-        self.audio_queue = queue.Queue(maxsize=50) # THÊM: Hàng đợi riêng cho tin nhắn thoại
-        
-        # LOCK SYSTEM CHUẨN
-        self.reply_time_lock = threading.Lock()
-        self.reply_lock = threading.Lock()
-        self.worker_restart_lock = threading.Lock()
-        self.toast_lock = threading.Lock()
-        
-        self._last_toast = 0
-        self.gc_counter = 0
-        self._restarting_msg_worker = False
-        self._restarting_reply_worker = False
-        self.last_webview_bounds = None
-        Window.softinput_mode = "pan"  # Dùng pan thay below_target để tránh bàn phím bật lên tự động
+        @JavascriptInterface
+        public void onLoginSuccess(String name, String avatar) {
+            pythonMsgQueue.add("LOGIN_SUCCESS|||" + name + "|||" + avatar);
+        }
 
-    def safe_toast(self, msg):
-        """Bảo vệ UI EventLoop khỏi spam toast"""
-        with self.toast_lock:
-            now = time.time()
-            if now - self._last_toast < 1.5:
-                return
-            self._last_toast = now
-        Clock.schedule_once(lambda dt: toast(msg), 0)
+        @JavascriptInterface
+        public void onNewWebMsg(String group, String msg, String msgId, String conversationId) {
+            pythonMsgQueue.add("WEB_NEW_MSG|||" + group + "|||" + msg + "|||" + msgId + "|||" + conversationId);
+        }
 
-    def _process_ui_queue(self, dt):
-        """Xử lý UI Update tập trung, chống Crash & Lag UI"""
-        try:
-            for _ in range(5): # Giới hạn 5 task / frame
-                task, args = self.ui_queue.get_nowait()
-                if task == 'add_ride':
-                    self.add_ride_card(*args)
-                elif task == 'log':
-                    self.log_history(*args)
-                elif task == 'toast':
-                    self.safe_toast(*args)
-                elif task == 'speak':
-                    if platform == 'android':
-                        try:
-                            from plyer import tts
-                            tts.speak(args)
-                        except: pass
-                # ĐÓN LỆNH XÓA THẺ KHI AUTO CHỐT THÀNH CÔNG VỚI MÃ KHÓA
-                elif task == 'remove_by_key':
-                    self.remove_ride_by_key(args)
-                self.ui_queue.task_done()
-        except queue.Empty:
-            pass
+        @JavascriptInterface
+        public void onGroupListReceived(String jsonGroups) {
+            pythonMsgQueue.add("GROUPS_DATA|||" + jsonGroups);
+        }
+		@JavascriptInterface
+        public void onLogout() {
+            pythonMsgQueue.add("ZALO_LOGOUT|||");
+        }
 
-    def remove_ride_by_key(self, cache_key):
-        """Duyệt tìm thẻ cuốc xe trong danh sách theo mã khóa và xóa khỏi giao diện"""
-        try:
-            ride_list = self.root.ids.ride_list
-            for card in list(ride_list.children):
-                if getattr(card, 'cache_key', '') == cache_key:
-                    self.remove_ride(card)
-                    break # Xóa xong thẻ trùng khớp thì thoát vòng lặp ngay
-        except Exception as e:
-            logger.error(f"Lỗi remove_ride_by_key: {e}")
+        @JavascriptInterface
+        public void onError(String code, String detail) {
+            Log.e(TAG, "JS_ERROR: " + code + " - " + detail);
+        }
+    }
 
-    def show_guide_popup(self):
-        popup = GuidePopup()
-        popup.open()
+    // =========================================================
+    // KHỞI TẠO WEBVIEW TƯƠNG THÍCH MỌI PHIÊN BẢN ANDROID 10 -> 15
+    // =========================================================
+    public static void initWebView(final Activity activity) {
+        if (activity == null) return;
+        activityRef = new WeakReference<>(activity);
 
-    
-    def request_ignore_battery(self):
-        if platform == 'android':
-            from jnius import autoclass
-            Context = autoclass('android.content.Context')
-            Intent = autoclass('android.content.Intent')
-            Uri = autoclass('android.net.Uri')
-            PowerManager = autoclass('android.os.PowerManager')
-            
-            activity = autoclass('org.kivy.android.PythonActivity').mActivity
-            pm = activity.getSystemService(Context.POWER_SERVICE)
-            
-            if not pm.isIgnoringBatteryOptimizations(activity.getPackageName()):
-                intent = Intent(autoclass('android.provider.Settings').ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
-                intent.setData(Uri.parse("package:" + activity.getPackageName()))
-                activity.startActivity(intent)        
-    def on_stop(self):
-        self.app_running = False 
-        
-        # CHỐNG ZOMBIE THREAD: Ép Join luồng trước khi thoát
-        try:
-            if hasattr(self, 'msg_worker_thread') and self.msg_worker_thread:
-                self.msg_worker_thread.join(timeout=2)
-            if hasattr(self, 'reply_worker_thread') and self.reply_worker_thread:
-                self.reply_worker_thread.join(timeout=2)
-        except: pass
-        
-        if platform == 'android':
-            try:
-                # CHỐNG LEAK CONTEXT RECEIVER
-                if hasattr(self, 'br'):
-                    try:
-                        self.br.stop()
-                        self.br = None
-                    except: pass
-                    
-                # 3. Dùng vòng while nhả triệt để reference counter của Wakelock
-                if hasattr(self, 'wakelock') and self.wakelock is not None:
-                    try:
-                        while self.wakelock.isHeld():
-                            self.wakelock.release()
-                    except Exception as we: logger.error(f"Wakelock Error: {we}")
+        activity.runOnUiThread(() -> {
+            try {
+                if (hiddenWebView != null) return;
 
-                # 4. Nhả triệt để Wifilock
-                if hasattr(self, 'wifilock') and self.wifilock is not None:
-                    try:
-                        while self.wifilock.isHeld():
-                            self.wifilock.release()
-                    except Exception as wfe: logger.error(f"Wifilock Error: {wfe}")
+                webLayout = new FrameLayout(activity);
+                hiddenWebView = new WebView(activity);
 
-            except Exception as e:
-                logger.error(f"Lỗi dọn dẹp on_stop: {e}")
-    def check_for_update(self):
-        """Hàm tự động gửi yêu cầu kiểm tra phiên bản từ server Gist"""
-        def on_success(req, result):
-            try:
-                import json
+                // =========================================================
+                // CẤU HÌNH LAYER TYPE - ÉP DÙNG HARDWARE ĐỂ VẼ QR CANVAS
+                // =========================================================
+                hiddenWebView.setLayerType(View.LAYER_TYPE_NONE, null);
+
+                // Android 8+ trở lên: Ưu tiên tài nguyên hệ thống cho render process
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                    hiddenWebView.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, true);
+                }
+
+                // =========================================================
+                // CẤU HÌNH WEBSETTINGS TƯƠNG THÍCH MỌI PHIÊN BẢN CHROME CORE
+                // =========================================================
+                WebSettings settings = hiddenWebView.getSettings();
+                settings.setJavaScriptEnabled(true);
+                settings.setDomStorageEnabled(true);
+                settings.setDatabaseEnabled(true);
+                settings.setAllowFileAccess(true);
+                settings.setLoadsImagesAutomatically(true);
+                settings.setMediaPlaybackRequiresUserGesture(false);
+                settings.setCacheMode(WebSettings.LOAD_DEFAULT);
+                settings.setNeedInitialFocus(false);
+                settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+                settings.setUseWideViewPort(true);
+                settings.setLoadWithOverviewMode(true);
                 
-                # --- SỬA LỖI CHÍ MẠNG Ở ĐÂY ---
-                # Kiểm tra nếu result là chuỗi (do GitHub trả về) thì ép kiểu nó thành Dictionary
-                if isinstance(result, str):
-                    data = json.loads(result)
-                else:
-                    data = result
+                // BẬT ZOOM NGẦM ĐỂ TRÁNH CSS ẨN KHUNG QR ĐĂNG NHẬP
+                settings.setSupportZoom(true);
+                settings.setBuiltInZoomControls(true);
+                settings.setDisplayZoomControls(false);
 
-                # Bây giờ dùng data.get() mới hoàn toàn an toàn
-                server_ver = float(data.get("version", 1.0))
-                update_note = str(data.get("note", "Vui lòng cập nhật phiên bản mới để tiếp tục sử dụng."))
-                apk_download_url = str(data.get("url", ""))
-                
-                # Nếu bản trên mạng lớn hơn bản trong máy
-                if server_ver > float(self.APP_VERSION):
-                    # Kích hoạt popup hiển thị trên luồng chính UI
-                    from kivy.clock import Clock
-                    Clock.schedule_once(lambda dt: self.show_update_popup(server_ver, update_note, apk_download_url), 0.5)
-            except Exception as e:
-                logger.error(f"Lỗi xử lý dữ liệu update: {e}")
+                // OffscreenPreRaster: Chỉ kích hoạt trên Android 11+ nhằm tối ưu tải trang ngầm
+                settings.setOffscreenPreRaster(true);
 
-        def on_error(req, error):
-            logger.error(f"Không thể kết nối máy chủ update: {error}")
+                // ForceDark: Tắt chế độ tối trên Android 10+ để mã QR hiển thị rõ nét nhất
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                    settings.setForceDark(WebSettings.FORCE_DARK_OFF);
+                }
 
-        try:
-            import time
-            from kivy.network.urlrequest import UrlRequest
-            
-            # --- SỬA LỖI CACHE Ở ĐÂY ---
-            # Thêm mốc thời gian vào cuối link để ép điện thoại luôn tải file mới nhất, không bị dính cache
-            no_cache_url = f"{self.UPDATE_URL}?t={int(time.time())}"
-            
-            # Gửi request ngầm không lo treo app
-            UrlRequest(no_cache_url, on_success=on_success, on_error=on_error, on_failure=on_error, timeout=10)
-        except Exception as e:
-            logger.error(f"Lỗi gọi UrlRequest: {e}")
-    def _process_image_ocr_thread(self, photo_url, group_id, group_name, sender, msg_id, is_group, raw_data):
-        """Luồng ngầm: Nhờ máy chủ OCR.space đọc chữ trong ảnh"""
-        import requests
-        try:
-            api_key = self.config_data.get('ocr_api_key', '').strip()
-            if not api_key:
-                api_key = "K86976001788957"
-            
-            url = f"https://api.ocr.space/parse/imageurl?apikey={api_key}&url={photo_url}&language=vie&isOverlayRequired=false"
+                // =========================================================
+                // ⚠️ BẮT BUỘC GIỮ USER AGENT DESKTOP
+                // Để Zalo luôn kích hoạt phiên bản máy tính phục vụ cào quét tin ngầm
+                // =========================================================
+                settings.setUserAgentString(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+                    "AppleWebKit/537.36 (KHTML, like Gecko) " +
+                    "Chrome/136.0.0.0 Safari/537.36"
+                );
 
-            res = requests.get(url, timeout=15)
-            if res.status_code == 200:
-                result = res.json()
-                
-                # Kiểm tra nếu đọc thành công và có chữ
-                if not result.get('IsErroredOnProcessing') and result.get('ParsedResults'):
-                    text_found = result['ParsedResults'][0].get('ParsedText', '').strip()
+                // =========================================================
+                // QUẢN LÝ COOKIE THÀNH PHẦN THỨ BA
+                // =========================================================
+                CookieManager cookieManager = CookieManager.getInstance();
+                cookieManager.setAcceptCookie(true);
+                cookieManager.setAcceptThirdPartyCookies(hiddenWebView, true);
 
-                    if text_found:
-                        # Đã đọc được chữ -> Biến nó thành một tin nhắn chữ bình thường
-                        full_msg = f"{sender}: [Ảnh] {text_found}" if sender else f"[Ảnh] {text_found}"
+                hiddenWebView.addJavascriptInterface(new WebAppInterface(activity), "ZAutoBridge");
+                hiddenWebView.setWebChromeClient(new WebChromeClient());
 
-                        # Đẩy vào hàng đợi (Queue) để Radar bắt cuốc quét Regex như tin text
-                        self.msg_queue.put_nowait((
-                            'WEB_NEW_MSG',
-                            {
-                                'group': group_name,          # ✅ Tên nhóm để kiểm tra Filter và hiện UI
-                                'msg': full_msg,
-                                'msg_id': msg_id,
-                                'conversation_id': group_id,  # ✅ Bắt buộc giữ ID gốc để API gửi tin chốt
-                                'is_group': is_group,
-                                'raw_data': raw_data
+                // =========================================================
+                // WEBVIEW CLIENT: XỬ LÝ LỖI MẠNG VÀ INJECT JS TỰ ĐỘNG
+                // =========================================================
+                hiddenWebView.setWebViewClient(new WebViewClient() {
+                    @Override
+                    public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
+                        if (request != null && request.isForMainFrame()) {
+                            Log.e(TAG, "Lỗi kết nối Zalo: " + error.getDescription());
+                            view.postDelayed(() -> {
+                                if (view != null) safeReload();
+                            }, 5000);
+                        }
+                    }
+
+                    @Override
+                    public void onReceivedSslError(WebView view, SslErrorHandler handler, SslError error) {
+                        // VÁ LỖI ANDROID 10: Bỏ qua lỗi bắt tay SSL do chứng chỉ trung gian Let's Encrypt hết hạn trên máy cũ
+                        handler.proceed();
+                    }
+
+                    @Override
+                    public void onPageFinished(WebView view, String url) {
+                        super.onPageFinished(view, url);
+                        CookieManager.getInstance().flush();
+                        
+                        // ĐÃ TẮT: Không tiêm JS cào tin nhắn của Java nữa vì Node.js đã lo việc này
+                        /*
+                        view.postDelayed(() -> {
+                            try {
+                                if (hiddenWebView != null) injectSidebarObserver(hiddenWebView);
+                            } catch (Exception e) {
+                                Log.e(TAG, "Inject Error", e);
                             }
-                        ))
-                        logger.info(f"📷 Đã dịch OCR thành công: {text_found[:50]}...")
-        except Exception as e:
-            logger.error(f"❌ Lỗi khi đọc chữ từ ảnh OCR: {e}")
-    def show_system_debug(self):
-        """Hàm siêu âm toàn bộ hệ thống để tìm lỗi Node.js/APK (V2 - libnode.so)"""
-        import os
-        import socket
-        import platform as std_platform
-        from jnius import autoclass
-        
-        # Lấy thông tin Activity để tìm thư viện
-        PythonActivity = autoclass('org.kivy.android.PythonActivity')
-        native_lib_dir = PythonActivity.mActivity.getApplicationInfo().nativeLibraryDir
-        
-        # Đường dẫn tới file libnode.so trong thư viện hệ thống
-        node_bin_path = os.path.join(native_lib_dir, 'libnode.so')
-        
-        # Đường dẫn server.js (vẫn lấy từ app dir)
-        app_dir = os.path.join(os.getenv('ANDROID_PRIVATE', '/data/data/org.zauto.zauto/files'), 'app')
-        server_js = os.path.join(app_dir, 'nodejs_backend', 'server.js')
-        
-        log_text = "[b]TRẠNG THÁI HỆ THỐNG V2:[/b]\n\n"
-        
-        # 1. Thông tin thiết bị
-        cpu_arch = std_platform.machine().lower()
-        log_text += f"📱 CPU: {cpu_arch}\n\n"
-        
-        # 2. Kiểm tra File Node.js (libnode.so)
-        if os.path.exists(node_bin_path):
-            log_text += f"✅ File libnode.so: TỒN TẠI\n"
-            log_text += f"   - Quyền thực thi (X_OK): {os.access(node_bin_path, os.X_OK)}\n"
-        else:
-            log_text += f"❌ File libnode.so: KHÔNG TÌM THẤY (Build APK thiếu file)\n"
+                        }, 5000);
+                        */
+                    }
+                    
+                    @Override
+                    public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
+                        Log.e(TAG, "WEBVIEW RENDER DEAD. RECOVERING...");
+                        if (webLayout != null) webLayout.removeAllViews();
+                        if (hiddenWebView != null) {
+                            hiddenWebView.destroy();
+                            hiddenWebView = null;
+                        }
+                        Activity act = activityRef != null ? activityRef.get() : null;
+                        if (act != null) {
+                            // Chờ 2 giây giải phóng luồng cũ rồi tự động khởi tạo lại hệ thống ngầm
+                            new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                                initWebView(act);
+                            }, 2000);
+                        }
+                        return true;
+                    }
+                });
+
+                hiddenWebView.loadUrl("https://id.zalo.me/account?continue=https://chat.zalo.me");
+
+                FrameLayout.LayoutParams webParams = new FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT
+                );
+                webLayout.addView(hiddenWebView, webParams);
+                // Đẩy webLayout ra tọa độ âm (ngoài màn hình) ngay từ đầu để không che Kivy
+				FrameLayout.LayoutParams rootParams = new FrameLayout.LayoutParams(1080, 2400);
+				rootParams.leftMargin = -2000; 
+				rootParams.topMargin = -2000;
+
+				webLayout.setAlpha(0.01f);  
+				webLayout.setTranslationZ(-100f); 
+
+				if (webLayout.getParent() != null) {  
+					((ViewGroup) webLayout.getParent()).removeView(webLayout);
+				}
+
+				activity.addContentView(webLayout, rootParams);
+
+                hiddenWebView.setVisibility(View.VISIBLE);
+                hiddenWebView.bringToFront();
+                hiddenWebView.requestFocus();
+
+                // KHỞI TẠO GIỌNG NÓI TIẾNG VIỆT CÓ BẢO VỆ FALLBACK
+                if (tts == null) {
+                    tts = new TextToSpeech(activity.getApplicationContext(), status -> {
+                        if (status == TextToSpeech.SUCCESS) {
+                            int result = tts.setLanguage(new Locale("vi", "VN"));
+                            if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+                                // Nếu máy thiếu dữ liệu gói tiếng Việt, tự động lùi về ngôn ngữ mặc định của máy để tránh câm loa
+                                tts.setLanguage(Locale.getDefault());
+                                Log.w(TAG, "TTS: Thừa dữ liệu tiếng Việt, lùi về ngôn ngữ hệ thống thiết bị.");
+                            }
+                        }
+                    });
+                }
+
+                // ĐÃ TẮT WATCHDOG: Giúp WebView ngủ đông hoàn toàn khi ẩn, không gây nóng máy
+                // startWatchdog();
+
+            } catch (Exception e) {
+                Log.e(TAG, "Init Error", e);
+            }
+        });
+    }
+
+    // =========================================================
+    // JS OBSERVER & API INTERNAL (CHẠY NGẦM 100%)
+    // =========================================================
+    public static void injectSidebarObserver(WebView view) {
+        String js =
+            "(function() {" +
+            "   if(window.zauto_started) return;" +
+            "   window.zauto_started = true;" +
+            "   window.zauto_boot_time = Date.now();" +
+            "   window.zauto_seen = {};" +
+            "   window.zauto_seen_keys = [];" +
+
+            // HÀM GỬI REPLY ĐA TẦNG (DÙNG SELECTOR CHUẨN + ENTER + BÁO CÁO TOAST)
+            "   window.zautoSendReply = function(convId, fakeMsgId, text, groupName) {" +
+            "       try {" +
+            "           let item = document.querySelector('.msg-item[anim-data-id=' + convId + '] .conv-item');" +
+            "           if(item) {" +
+            "               let key = Object.keys(item).find(k => k.startsWith('__reactEventHandlers') || k.startsWith('__reactFiber'));" +
+            "               if (key && item[key]) {" +
+            "                   if (item[key].onClick) item[key].onClick({preventDefault:()=>{}, stopPropagation:()=>{}});" +
+            "                   else if (item[key].return && item[key].return.memoizedProps.onClick) item[key].return.memoizedProps.onClick({preventDefault:()=>{}, stopPropagation:()=>{}});" +
+            "               } else { item.click(); }" +
+            "           }" +
             
-        if os.path.exists(server_js):
-            log_text += f"✅ File server.js: TỒN TẠI\n"
-        else:
-            log_text += f"❌ File server.js: KHÔNG TÌM THẤY\n"
+            "           setTimeout(() => {" +
+            "               let realMsgId = '';" +
+            "               try {" +
+            "                   let msgs = document.querySelectorAll('[id^=msg_]');" +
+            "                   if (msgs && msgs.length > 0) {" +
+            "                       let lastMsg = msgs[msgs.length - 1];" +
+            "                       realMsgId = lastMsg.getAttribute('id').substring(4);" +
+            "                   }" +
+            "               } catch(err) { realMsgId = ''; }" +
             
-        # 3. Kiểm tra Tiến trình Node
-        log_text += "\n"
-        if hasattr(self, 'node_process') and self.node_process:
-            status = self.node_process.poll()
-            if status is None:
-                log_text += "✅ Tiến trình Node: ĐANG CHẠY\n"
-            else:
-                log_text += f"❌ Tiến trình Node: ĐÃ CHẾT (Mã lỗi: {status})\n"
-                # Đọc thử lỗi cuối cùng nếu có
-                try:
-                    err_out = self.node_process.stderr.read()
-                    if err_out:
-                        log_text += f"   - Chi tiết: {err_out.decode('utf-8', errors='ignore')[:100]}\n"
-                except: pass
-        else:
-            # Hiện lỗi khởi tạo nếu có lưu
-            err = getattr(self, 'node_start_error', 'Chưa khởi động')
-            log_text += f"❌ Tiến trình Node: {err}\n"
+            "               if (window.zMessenger && typeof window.zMessenger.sendMessage === 'function') {" +
+            "                   let req = { toid: convId, msg: text, type: 1 };" +
+            "                   if (realMsgId && realMsgId !== '') req.quote = { globalMsgId: realMsgId, msg: text, type: 1 };" +
+            "                   window.zMessenger.sendMessage(req);" +
+            "                   ZAutoBridge.onLoginSuccess('Đã chốt xong:', groupName);" + 
+            "               } else {" +
+            "                   let input = document.getElementById('richInput');" +
+			"                   if(input) {" +
+			"                       input.setAttribute('readonly','true'); input.focus(); input.removeAttribute('readonly');" +
+			"                       input.innerHTML = '';" +
+			"                       document.execCommand('insertText', false, text);" +
+			"                       input.dispatchEvent(new Event('input', {bubbles:true}));" +
+			"                       input.blur();" +
+            "                       let attempts = 0;" +
             
-        # 4. Kiểm tra Cổng API 5000
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(1.0)
-        try:
-            result = sock.connect_ex(('127.0.0.1', 5000))
-            if result == 0:
-                log_text += "✅ Cổng 5000: ĐÃ MỞ (Sẵn sàng API)\n"
-            else:
-                log_text += f"❌ Cổng 5000: BỊ ĐÓNG (Code: {result})\n"
-        except Exception as e:
-            log_text += f"❌ Lỗi quét cổng: {e}\n"
-        finally:
-            sock.close()
+            "                       let trySend = setInterval(() => {" +
+            "                           attempts++;" +
+            "                           let btnSend = null;" +
+            "                           let primarySelector = '#chat-input-container-id > div.chat-input-container__right-layout > div.normal-buttons-group > div.send-msg-btn';" +
+            "                           let fallbackSelectors = ['.fa-Sent-msg_24_Line', '[data-translate-title=STR_SEND]'];" +
             
-        # Hiển thị lên màn hình (Giữ nguyên giao diện Popup cũ)
-        content = BoxLayout(orientation='vertical', padding="10dp")
-        lbl = Label(text=log_text, markup=True, halign='left', valign='top', text_size=(Window.width * 0.8, None))
-        lbl.bind(texture_size=lbl.setter('size'))
-        scroll = ScrollView(size_hint=(1, 1))
-        scroll.add_widget(lbl)
-        
-        btn = Button(text="ĐÓNG", size_hint_y=None, height="45dp", background_color=(0.8, 0.2, 0.2, 1))
-        
-        content.add_widget(scroll)
-        content.add_widget(btn)
-        
-        popup = Popup(title="Báo cáo gỡ lỗi V2", content=content, size_hint=(0.9, 0.7), auto_dismiss=False)
-        btn.bind(on_release=popup.dismiss)
-        popup.open()  
-class GuidePopup(Popup):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.title = "📖 BÍ KÍP SỬ DỤNG ZAUTO VIP"
-        self.size_hint = (0.95, 0.85) # Rộng 95%, Cao 85% màn hình
-        self.background = ""  
-        self.background_color = (1, 1, 1, 1) 
-        self.title_color = (0, 0, 0, 1)      
-        self.separator_color = (0.1, 0.5, 0.8, 1)
+            "                           let el = document.querySelector(primarySelector);" +
+            "                           if (el) {" +
+            "                               btnSend = el;" +
+            "                           } else {" +
+            "                               for (let sel of fallbackSelectors) {" +
+            "                                   let fallbackEl = document.querySelector(sel);" +
+            "                                   if (fallbackEl) {" +
+            "                                       btnSend = fallbackEl.closest('.z--btn--v2') || fallbackEl.parentElement || fallbackEl;" +
+            "                                       break;" +
+            "                                   }" +
+            "                               }" +
+            "                           }" +
+            
+            "                           if (btnSend) {" +
+            "                               btnSend.click();" +
+            "                               let key = Object.keys(btnSend).find(k => k.startsWith('__reactEventHandlers') || k.startsWith('__reactFiber'));" +
+            "                               if(key && btnSend[key] && btnSend[key].onClick) btnSend[key].onClick({preventDefault:()=>{}, stopPropagation:()=>{}});" +
+            "                           }" +
+            
+            "                           let enterEvent = new KeyboardEvent('keydown', { bubbles: true, cancelable: true, keyCode: 13, which: 13, key: 'Enter', code: 'Enter' });" +
+            "                           input.dispatchEvent(enterEvent);" +
+            
+            "                           if (input.innerHTML === '' || input.innerHTML === '<br>') {" +
+            "                               clearInterval(trySend);" +
+            "                               ZAutoBridge.onLoginSuccess('Đã chốt xong:', groupName);" + 
+            "                           } else if (attempts > 12) {" +
+            "                               clearInterval(trySend);" +
+            "                           }" +
+            "                       }, 250);" + 
+            "                   }" +
+            "               }" +
+            "           }, 800);" + 
+            "       } catch(e) {}" +
+            "   };" +
 
-        root_scroll = ScrollView(size_hint=(1, 1), do_scroll_x=False)
-        main_layout = BoxLayout(orientation='vertical', padding=dp(15), spacing=dp(15), size_hint_y=None)
-        main_layout.bind(minimum_height=main_layout.setter('height'))
+            // HÀM QUÉT SIDEBAR (ĐÃ FIX ZALO ĐỔI GIAO DIỆN & TÌM ĐÚNG ID TIN)
+            "   function scanConvItem(msgItemEl) {" +
+            "       try {" +
+            "           let convItem = msgItemEl.querySelector('.conv-item') || msgItemEl;" + 
+            "           if(!convItem) return;" +
+            
+            "           let nameEl = convItem.querySelector('.conv-item-title__name, [class*=name]');" +
+            "           let bodyEl = convItem.querySelector('.conv-item-body, [class*=snippet], [class*=message-text]');" +
+            "           if(!nameEl) return;" + 
+            "           let groupName = (nameEl.textContent || nameEl.innerText || '').trim();" +
+            "           let msgText = bodyEl ? (bodyEl.textContent || bodyEl.innerText || '').trim() : '';" +
+            
+            "           let realMsgId = ''; var fullTxt = ''; let convId = '';" +
+            
+            // DEEP BYPASS: QUÉT VÉT CẠN MỌI TẦNG REACT FIBER (8 TẦNG) ĐỂ LỘT TRẦN ID BỊ GIẤU
+            "           try {" +
+			"               convId = msgItemEl.getAttribute('anim-data-id') || msgItemEl.id || '';" +
+			"               let id1 = msgItemEl.getAttribute('data-msg-id') || (msgItemEl.dataset ? msgItemEl.dataset.msgId : '');" +
+			"               if (id1 && id1.length > 5) realMsgId = id1;" +
+			"               if (!realMsgId) {" +
+			"                   let qidEl = msgItemEl.querySelector('[data-qid]') || msgItemEl.closest('[data-qid]');" +
+			"                   let qid = qidEl ? qidEl.getAttribute('data-qid') : null;" +
+			"                   if (qid) {" +
+			"                       let qparts = qid.split('_');" +
+			"                       if (qparts.length >= 2 && qparts[1] && qparts[1].length > 4) {" +
+			"                           realMsgId = qparts[1];" +
+			"                           if (!convId) { let sp = qparts[0].split('@'); if(sp[1]) convId = sp[1]; }" +
+			"                       }" +
+			"                   }" +
+			"               }" +
+            
+            "               let keys = Object.keys(msgItemEl);" +
+            "               let rK = keys.find(k => k.startsWith('__reactFiber') || k.startsWith('__reactProps'));" +
+            "               if (rK && msgItemEl[rK]) {" +
+			"                   let node = msgItemEl[rK];" +
+			"                   if (node) {" +
+			"                       let p = node.memoizedProps || node.pendingProps;" +
+			"                       if(!convId && p && p.session) { convId = String(p.session.id); }" +
+			"                       if(!convId && p && p.convId) { convId = String(p.convId); }" +
+			"                   }" +
+			"                   for(let step = 0; step < 8; step++) {" + 
+            "                       if(!node) break;" +
+            "                       let currProps = node.memoizedProps || node.pendingProps;" +
+            "                       if (currProps) {" +
+            "                           let o = currProps.msg || currProps.message || currProps.data || currProps.item || currProps;" +
+            "                           if (o && typeof o === 'object') {" +
+			"                               let foundId = o.msgId || o.messageId || o.cliMsgId || o.globalMsgId;" +
+			"                               if (!foundId && o.timestamp) foundId = 'TS_' + o.timestamp;" + 
+			"                               if (!realMsgId && foundId && String(foundId).length > 5) { realMsgId = String(foundId); }" +
+			"                               if (!fullTxt && typeof o.content === 'string' && o.content.trim() !== '') { fullTxt = o.content; }" +
+			"                               if (!convId && o.fromId) { convId = String(o.fromId); }" +
+			"                               if (!convId && o.toId) { convId = String(o.toId); }" +
+			"                           }" +
+			"                           if (!convId && currProps.session && currProps.session.id) { convId = String(currProps.session.id); }" +
+			"                           if (!convId && currProps.convId) { convId = String(currProps.convId); }" +
+			"                           if (!convId && currProps.conversationId) { convId = String(currProps.conversationId); }" +
+			"                       }" +
+			"                       node = node.return;" +
+            "                   }" +
+            "               }" +
+            "           } catch(err) {}" +
+            
+            "           if (fullTxt && fullTxt.length > msgText.length && !fullTxt.startsWith('{')) {" +
+            "               msgText = fullTxt.trim();" +
+            "           }" +
+            
+            "           let isVoiceNode = bodyEl ? bodyEl.querySelector('[class*=audio],[class*=voice],[class*=Voice],[class*=record],[class*=AudioMessage],[class*=VoiceMsg]') : null;" +
+			"           if (!isVoiceNode && bodyEl) { let svgs = bodyEl.querySelectorAll('svg'); for (let s of svgs) { if (s.closest('[class*=audio],[class*=voice],[class*=record],[class*=Voice]')) { isVoiceNode = s; break; } } }" +
+			"           let isTimeOnly = (isVoiceNode && bodyEl) ? (/^[0-9]{1,2}:[0-9]{2}$/.test(msgText) || /^[0-9]{1,2}:[0-9]{2}$/.test(bodyEl.innerText.trim())) : false;" +
+            "           let seconds = -1; let isVoice = false;" +
+            
+            "           if (isVoiceNode || isTimeOnly) {" +
+            "               isVoice = true;" +
+            "               let rawBody = bodyEl.textContent || bodyEl.innerText || '';" +
+            "               if (rawBody.indexOf(': ') > -1) {" +
+            "                   msgText = rawBody.split(': ')[0] + ': [Tin nhắn thoại]';" +
+            "               } else {" +
+            "                   msgText = '[Tin nhắn thoại]';" +
+            "               }" +
+            "               try {" +
+            "                   let timeNode = msgItemEl.querySelector('[class*=audio-time], [class*=duration], span[class*=time]');" +
+            "                   if (timeNode) {" +
+            "                       let durationText = timeNode.innerText.trim();" + 
+            "                       if (durationText.includes(':')) {" +
+            "                           let parts = durationText.split(':');" +
+            "                           seconds = parseInt(parts[0], 10) * 60 + parseInt(parts[1], 10);" +
+            "                       }" +
+            "                   }" +
+            "               } catch(err) { seconds = -1; }" +
+            "               msgText = msgText + '%%%' + seconds;" + 
+            "           }" +
 
-        guide_text = """[b]1. TÍNH NĂNG ĐỌC ẢNH (OCR)[/b]
-• App có thể đọc chữ trong ảnh chụp màn hình cuốc xe.
-• Nhấp nút xanh bên dưới để vào trang web đăng ký. 
-• Điền Email -> Chọn "Vietnamese" -> Bấm Đăng ký.
-• Vào hộp thư Email, copy đoạn mã API Key (VD: K8697...).
-• Quay lại app, bấm nút dán vào ô "Mã API Key OCR".
-• Bấm LƯU CẤU HÌNH.
+            "           if(!groupName) return;" +
+            "           if(!msgText || msgText.length < 1) {" +
+            "               setTimeout(() => { try { scanConvItem(msgItemEl); }catch(e){} }, 1000);" +
+            "               return;" +
+            "           }" +
 
-[b]2. TỪ KHÓA BẮT CUỐC[/b]
-• [b]Từ khóa Nhận:[/b] Nếu tin nhắn CÓ chứa từ này, app sẽ bắt. (VD: Nội bài, ghép, tiện chuyến).
-• [b]Từ khóa Loại trừ:[/b] Nếu tin nhắn CÓ chứa từ này, app BỎ QUA lập tức. (VD: full, đã đủ).
-• Viết cách nhau bằng dấu phẩy (,). 
-• Muốn app bắt MỌI TIN NHẮN (không cần từ khóa), hãy TẮT công tắc "Chỉ nhận tin chứa Từ Khóa".
+            "           let timeEl = convItem.querySelector('.conv-item-title__time, [class*=time]');" +
+			"           let timeString = timeEl ? (timeEl.textContent || '').trim() : '';" +
+			"           let senderEl = msgItemEl ? (msgItemEl.querySelector('.sender-name,[class*=sender],[class*=author],[class*=from-name]') || msgItemEl.querySelector('[class*=conv-item-title__name]')) : null;" +
+			"           let senderName = senderEl ? (senderEl.textContent || '').trim().substring(0, 20) : '';" +
 
-[b]3. TÍNH NĂNG AUTO (CHỐT TỰ ĐỘNG)[/b]
-• Nếu Bật: App thấy cuốc là tự động gửi tin nhắn chốt.
-• Nội dung chốt: Điền ở ô "Nội dung trả lời tự động".
-• Khoảng cách Delay: Tránh Zalo khóa mõm nếu chốt liên tục. Mặc định 30 giây.
+            // =========================================================================
+            // FIX LỖI LẶP TIN: Dùng stableId cố định, không phụ thuộc vào đồng hồ TIME_
+            // =========================================================================
+            "           let stableId;" +
+            "           if (realMsgId && realMsgId.length > 3 && !realMsgId.startsWith('TIME_')) {" +
+            "               stableId = realMsgId;" +
+            "           } else {" +
+            "               let contentForHash = msgText.replace(/%%%[-0-9]+$/, '').trim();" +
+            "               if (isVoice) {" +
+            "                   let voiceTimeKey = (realMsgId && realMsgId.length > 3 && !realMsgId.startsWith('TIME_') && !realMsgId.startsWith('TS_')) ? realMsgId : ('V_' + convId + '_' + timeString + '_' + senderName);" +
+			"                   stableId = 'VOICE_' + voiceTimeKey;" +
+            "               } else {" +
+            "                   stableId = 'CONTENT_' + convId + '_' + contentForHash.substring(0, 60);" +
+            "               }" +
+            "           }" +
+            "           let fp = 'MSG|' + convId + '|' + stableId;" +
 
-[b]4. HOẠT ĐỘNG NGẦM[/b]
-• Luôn bật "CHỐNG NGỦ ĐÔNG" để app không bị tắt khi vuốt ra ngoài lướt web, tiktok.
-"""
-        # Hộp chứa chữ tự động co giãn chiều cao
-        lbl = Label(
-            text=guide_text, markup=True, color=(0.15, 0.15, 0.15, 1), 
-            font_size='14sp', size_hint_y=None, halign='left', valign='top'
-        )
-        lbl.bind(
-            width=lambda *x: lbl.setter('text_size')(lbl, (lbl.width, None)),
-            texture_size=lambda *x: lbl.setter('height')(lbl, lbl.texture_size[1])
-        )
-        main_layout.add_widget(lbl)
+            "           if (!realMsgId || realMsgId === '') {" +
+            "               realMsgId = 'TIME_' + timeString;" +
+            "           }" +
+            "           if(window.zauto_seen[fp]) return;" +
+            "           window.zauto_seen[fp] = true;" +
+            "           window.zauto_seen_keys.push(fp);" +
+            "           if(window.zauto_seen_keys.length > 800) { " +
+            "               let old = window.zauto_seen_keys.splice(0, 200); " +
+            "               old.forEach(k => { delete window.zauto_seen[k]; });" + 
+            "           }" +
+            "           if (Date.now() - window.zauto_boot_time > 8000) {" +
+            "               ZAutoBridge.onNewWebMsg(groupName, msgText, realMsgId, convId);" +
+            "           }" +
+            "       } catch(e) {}" +
+            "   }" +
+            "   window.scanConvItem = scanConvItem;" +
+            // HÀM THU THẬP DANH SÁCH NHÓM
+            "   function collectGroups() {" +
+            "       try {" +
+            "           let groups = [];" +
+            "           let nameEls = document.querySelectorAll('.conv-item-title__name');" +
+            "           nameEls.forEach(el => {" +
+            "               let n = (el.innerText || el.textContent || '').trim();" +
+            "               if(n && n.length > 1 && n.length < 80 && !groups.includes(n)) groups.push(n);" +
+            "           });" +
+            "           if(groups.length > 0) ZAutoBridge.onGroupListReceived(JSON.stringify(groups));" +
+            "       } catch(e) {}" +
+            "   }" +
 
-        # Nút đăng ký web
-        btn_ocr = Button(
-            text="🌐 MỞ TRANG ĐĂNG KÝ MÃ OCR", size_hint_y=None, height=dp(45), 
-            background_normal='', background_color=(0.1, 0.6, 0.2, 1), bold=True
-        )
-        import webbrowser
-        btn_ocr.bind(on_release=lambda x: webbrowser.open("https://ocr.space/ocrapi/freekey"))
-        main_layout.add_widget(btn_ocr)
+            // OBSERVE CONTAINER SIDEBAR
+            "   function startSidebarObserver() {" +
+            "       let container = document.getElementById('conversationListId');" +
+            "       if(!container) {" +
+            "           setTimeout(startSidebarObserver, 1500);" +
+            "           return;" +
+            "       }" +
+            "       if(window.zauto_sidebar_observer) window.zauto_sidebar_observer.disconnect();" +
+            "       window.zauto_sidebar_observer = new MutationObserver(mutations => {" +
+			"           mutations.forEach(m => {" +
+			"               try {" +
+			"                   let targetNode = m.target.nodeType === 3 ? m.target.parentNode : m.target;" +
+			"                   let msgItem = targetNode.closest('.msg-item');" +
+			"                   if(msgItem) scanConvItem(msgItem);" +
+			"                   if (m.addedNodes && m.addedNodes.length > 0) {" +
+			"                       m.addedNodes.forEach(nd2 => {" +
+			"                           if (nd2.nodeType !== 1) return;" +
+			"                           var isMsg = (nd2.id && (nd2.id.startsWith('msg')||nd2.id.startsWith('message-frame_'))) || nd2.hasAttribute('data-qid') ||" +
+			"                                       nd2.classList.contains('msg-item') || nd2.querySelector('[data-qid],[id^=\"message-frame_\"],[id^=msg_],[id^=msg-]');" +
+			"                           if (isMsg) {" +
+			"                               let mi2 = nd2.closest('.msg-item') || nd2;" +
+			"                               if (mi2) scanConvItem(mi2);" +
+			"                           }" +
+			"                       });" +
+			"                   }" +
+			"               } catch(e) {}" +
+			"           });" +
+			"       });" +
+            "       window.zauto_sidebar_observer.observe(container, { childList: true, subtree: true, characterData: true });" +
+            "       document.querySelectorAll('.msg-item').forEach(scanConvItem);" +
+            "       collectGroups();" +
+            "       ZAutoBridge.onLoginSuccess('Đã kết nối', '');" +
+            "   }" +
 
-        # Nút đóng
-        btn_close = Button(
-            text="ĐÓNG HƯỚNG DẪN", size_hint_y=None, height=dp(45), 
-            background_normal='', background_color=(0.8, 0.2, 0.2, 1), bold=True
-        )
-        btn_close.bind(on_release=self.dismiss)
-        main_layout.add_widget(btn_close)
+            // WATCHDOG + NÚT ĐỒNG BỘ
+            "   function systemWatchdog() {" +
+            "       let imei = localStorage.getItem('z_uuid') || localStorage.getItem('sh_z_uuid') || '';" +
+            "       ZAutoBridge.onHeartbeat(Date.now().toString(), imei);" +
+            "       if(!navigator.onLine) { setTimeout(systemWatchdog, 10000); return; }" +
+            "       try {" +
+            "           let syncBtn = document.querySelector('.sync-msg-btn');" +
+            "           if(!syncBtn) {" +
+            "               let btns = document.querySelectorAll('button, div, span');" +
+            "               for(let b of btns) { if(b.innerText && (b.innerText.includes('Đồng bộ') || b.innerText.includes('Khôi phục'))) { syncBtn = b; break; } }" +
+            "           }" +
+            "           if(syncBtn && !window.zauto_sync_clicked) { window.zauto_sync_clicked = true; syncBtn.click(); }" +
+            "       } catch(e) {}" +
+            "       let isLoginScreen = document.querySelector('.qrcode') || document.querySelector('.login-container');" +
+			"       if(isLoginScreen) {" +
+			"           if(!window.zauto_logout_notified) { window.zauto_logout_notified = true; ZAutoBridge.onLogout(); }" +
+			"           if(!window.login_start_time) window.login_start_time = Date.now();" +
+			"           if(Date.now() - window.login_start_time > 180000) { window.login_start_time = Date.now(); location.reload(); }" +
+            "       } else {" +
+			"           window.login_start_time = null;" +
+			"           window.zauto_logout_notified = false;" +
+            "           let container = document.getElementById('conversationListId');" +
+            "           if(!container || !window.zauto_sidebar_observer) {" +
+            "               window.zauto_sidebar_observer = null;" +
+            "               startSidebarObserver();" +
+            "           }" +
+            "           window.zauto_group_tick = (window.zauto_group_tick || 0) + 1;" +
+            "           if(window.zauto_group_tick % 5 === 0) collectGroups();" +
+            "       }" +
+            "       let nextTick = document.hidden ? 15000 : 3000;" +
+            "       setTimeout(systemWatchdog, nextTick);" +
+            "   }" +
+            "   setInterval(() => { if(document.hidden) return; let container = document.getElementById('conversationListId'); if(container) document.querySelectorAll('.msg-item').forEach(scanConvItem); }, 2000);" +
+            "   setTimeout(startSidebarObserver, 1000);" +
+            "   setTimeout(systemWatchdog, 3000);" +
+            "})();";
 
-        root_scroll.add_widget(main_layout)
-        self.content = root_scroll
-if __name__ == '__main__':
-    ZAutoProApp().run()
+        safeEvaluateJs(js);
+    }
+
+    // =========================================================
+    // JAVA WATCHDOG (kiểm tra heartbeat từ JS)
+    // =========================================================
+    private static void startWatchdog() {
+        if (watchdogHandler == null) watchdogHandler = new Handler(Looper.getMainLooper());
+        if (watchdogRunnable != null) watchdogHandler.removeCallbacks(watchdogRunnable);
+
+        watchdogRunnable = new Runnable() {
+            @Override
+            public void run() {
+                if (hiddenWebView != null) {
+                    long now = System.currentTimeMillis();
+                    if (now - lastHeartbeat > 60000) {
+                        Log.e(TAG, "HEARTBEAT LOST. REQUESTING RELOAD...");
+                        safeReload();
+                    } else if (now - lastHeartbeat > 20000) {
+                        safeEvaluateJs("if(!window.zauto_started) location.reload();");
+                    }
+                }
+                watchdogHandler.postDelayed(this, 15000);
+            }
+        };
+        watchdogHandler.postDelayed(watchdogRunnable, 15000);
+    }
+
+    // =========================================================
+    // ĐIỀU CHỈNH TOẠ ĐỘ RENDER HIỂN THỊ WEB KHỚP VỚI CÁC TAB KIVY
+    // =========================================================
+    public static void updateWebViewBounds(
+            final Activity activity,
+            final int x, final int y,
+            final int width, final int height,
+            final boolean visible) {
+
+        Activity safeActivity = activityRef != null ? activityRef.get() : activity;
+        if (safeActivity == null) return;
+
+        safeActivity.runOnUiThread(() -> {
+            try {
+                if (webLayout == null) return;
+                FrameLayout.LayoutParams params =
+                        (FrameLayout.LayoutParams) webLayout.getLayoutParams();
+                if (!visible) {
+                    webLayout.setAlpha(0.01f);
+                    params.leftMargin = -2000;
+                    params.topMargin = -2000;
+                    params.width = 1080;
+                    params.height = 2400;
+                } else {
+                    // TRẠNG THÁI HIỆN (TAB ZALO): Nổi lên trên đỉnh, hiển thị sắc nét đúng tọa độ Kivy chỉ định
+                    webLayout.setAlpha(1.0f);
+                    webLayout.setTranslationZ(100f);
+                    params.leftMargin = x;
+                    params.topMargin = y;
+                    params.width = width;
+                    params.height = height;
+                    if (hiddenWebView != null) {
+                        hiddenWebView.invalidate();
+                        hiddenWebView.requestLayout();
+                    }
+                }
+                webLayout.setLayoutParams(params);
+            } catch (Exception e) {
+                Log.e(TAG, "updateWebViewBounds Error", e);
+            }
+        });
+    }
+    // HÀM ĐỌC GIỌNG NÓI TỪ PYTHON GỌI XUỐNG
+    public static void speak(String text) {
+        if (tts != null) {
+            tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, null);
+        }
+    }
+    public static void reloadWeb(final Activity activity) {
+        safeReload();
+    }
+
+    public static void onResume(final Activity activity) {
+        Activity safeActivity = activityRef != null ? activityRef.get() : activity;
+        if (safeActivity == null) return;
+        safeActivity.runOnUiThread(() -> {
+            try {
+                if (hiddenWebView != null) hiddenWebView.onResume();
+            } catch (Exception ignored) {}
+        });
+    }
+
+    public static void onPause() {
+        try {
+            // ĐÃ XÓA LỆNH: hiddenWebView.onPause(); -> Để Javascript vẫn chạy khi app ẩn
+        } catch (Exception ignored) {}
+    }
+
+    public static void destroy() {
+        if (watchdogHandler != null && watchdogRunnable != null) {
+            watchdogHandler.removeCallbacks(watchdogRunnable);
+        }
+        replyQueue.clear();
+        if (webLayout != null) {
+            webLayout.removeAllViews();
+            webLayout = null;
+        }
+        if (hiddenWebView != null) {
+            hiddenWebView.clearHistory();
+            hiddenWebView.clearCache(true);
+            hiddenWebView.destroy();
+            hiddenWebView = null;
+        }
+        if (activityRef != null) {
+            activityRef.clear();
+            activityRef = null;
+        }
+    }
+
+    // =========================================================
+    // ẨN BÀN PHÍM CỨNG - GỌI TRƯỚC MỌI THAO TÁC CHỐT CUỐC
+    // =========================================================
+    public static void hideKeyboard(final Activity activity) {
+        Activity safeActivity = activityRef != null ? activityRef.get() : activity;
+        if (safeActivity == null) return;
+        safeActivity.runOnUiThread(() -> {
+            try {
+                android.view.inputmethod.InputMethodManager imm =
+                    (android.view.inputmethod.InputMethodManager)
+                    safeActivity.getSystemService(android.content.Context.INPUT_METHOD_SERVICE);
+                android.view.View decorView = safeActivity.getWindow().getDecorView();
+                android.os.IBinder token = decorView.getWindowToken();
+                if (imm != null && token != null) {
+                    imm.hideSoftInputFromWindow(token, 0);
+                }
+                if (hiddenWebView != null) {
+                    hiddenWebView.evaluateJavascript(
+                        "(function(){ try { var a = document.activeElement; if(a && a !== document.body) a.blur(); document.body.focus(); } catch(e){} })();", null);
+                }
+            } catch (Exception e) {}
+        });
+    }
+
+    /// =========================================================
+    // HỆ THỐNG PHÁT BẢN GHI ÂM CHUẨN XÁC THEO ID (ĐÃ SỬA LỖI NỐI CHUỖI)
+    // =========================================================
+    public static void playSpecificAudio(final Activity activity, final String conversationId, final String msgId) {
+        Activity safeActivity = activityRef != null ? activityRef.get() : activity;
+        if (safeActivity == null || hiddenWebView == null) return;
+
+        safeActivity.runOnUiThread(() -> {
+            String js = "(function() {" +
+                "   let item = document.querySelector('.msg-item[anim-data-id=\"" + conversationId + "\"] .conv-item');" +
+                "   if(item) {" +
+                "       let key = Object.keys(item).find(k => k.startsWith('__reactEventHandlers') || k.startsWith('__reactFiber'));" +
+                "       if (key && item[key]) {" +
+                "           if (item[key].onClick) item[key].onClick({preventDefault:()=>{}, stopPropagation:()=>{}});" +
+                "           else if (item[key].return && item[key].return.memoizedProps.onClick) item[key].return.memoizedProps.onClick({preventDefault:()=>{}, stopPropagation:()=>{}});" +
+                "       } else { item.click(); }" +
+                "   }" +
+                "   setTimeout(() => {" +
+                "       let findAndPlay = () => {" +
+                "           let msgNode = document.querySelector('[data-msg-id=\"" + msgId + "\"]');" +
+                "           if (!msgNode) msgNode = document.querySelector('div[id*=\"" + msgId + "\"]');" +
+                "           if (!msgNode) {" +
+                "               let allMsgs = document.querySelectorAll('.chat-item');" +
+                "               if(allMsgs.length > 0) msgNode = allMsgs[allMsgs.length - 1];" +
+                "           }" +
+                "           if (!msgNode) return false;" +
+                "           let playBtn = msgNode.querySelector('.fa-PlayCircle_24_Filled, [class*=\"PlayCircle\"], .v-audio, i[class*=\"play\"], div[class*=\"play-btn\"]');" +
+                "           if(playBtn) {" +
+                "               playBtn.click();" +
+                "               let k = Object.keys(playBtn).find(key => key.startsWith('__reactEventHandlers') || key.startsWith('__reactFiber'));" +
+                "               if(k && playBtn[k] && playBtn[k].onClick) playBtn[k].onClick({preventDefault:()=>{}, stopPropagation:()=>{}});" +
+                "               return true;" +
+                "           }" +
+                "           return false;" +
+                "       };" +
+                "       if (!findAndPlay()) {" +
+                "           let retryCount = 0;" +
+                "           let interval = setInterval(() => {" +
+                "               retryCount++;" +
+                "               if (findAndPlay() || retryCount > 8) clearInterval(interval);" +
+                "           }, 500);" +
+                "       }" +
+                "   }, 1500);" +
+                "})();";
+            hiddenWebView.evaluateJavascript(js, null);
+        });
+    }
+	// =========================================================
+    // HÀM HÚT COOKIE TỪ TRÌNH DUYỆT CHUYỂN CHO PYTHON
+    // =========================================================
+    public static String extractZaloCookie() {
+        try {
+            CookieManager cookieManager = CookieManager.getInstance();
+            String cookie = cookieManager.getCookie("https://chat.zalo.me");
+            return cookie != null ? cookie : "";
+        } catch (Exception e) {
+            Log.e(TAG, "Loi lay Cookie: ", e);
+            return "";
+        }
+    }
+	public static String getImei() {
+        return currentImei;
+    }
+
+    public static String getUserAgent() {
+        // Trả về đúng User-Agent mà ta đã gán cho WebView lúc khởi tạo
+        return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
+    }
+}
