@@ -131,11 +131,10 @@ jobs:
           export P4A_RELEASE_KEYALIAS=zauto
           export GRADLE_OPTS="-Xmx4096m -Dorg.gradle.daemon=false"
           export PIP_NO_BUILD_ISOLATION=1
-
-          # Dòng quan trọng: Cấm buildozer tự ý nâng cấp pip/setuptools 
-          # bằng cách ép nó dùng chính các gói đã cài ở step "Install Build Tools"
           export BUILDOZER_PREFER_HOST_PIP=1
 
+          # ÉP BUILDOZER SỬ DỤNG PIP BẢN CŨ 23.3.1 (Rất ổn định cho P4A)
+          # Chúng ta sẽ cài đặt venv và ép nó dùng bản pip cũ ngay khi buildozer bắt đầu
           buildozer -v android release
 
       - name: Upload APK
