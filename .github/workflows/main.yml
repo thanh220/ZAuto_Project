@@ -46,15 +46,24 @@ jobs:
         run: |
           mkdir -p nodejs_backend/bin/arm64-v8a
           mkdir -p nodejs_backend/bin/armeabi-v7a
+
+          # arm64-v8a
           curl -LO https://nodejs.org/dist/v20.11.1/node-v20.11.1-linux-arm64.tar.xz
           tar -xf node-v20.11.1-linux-arm64.tar.xz
           cp node-v20.11.1-linux-arm64/bin/node nodejs_backend/bin/arm64-v8a/libnode.so
+          chmod +x nodejs_backend/bin/arm64-v8a/libnode.so
+
+          # armeabi-v7a
           curl -LO https://nodejs.org/dist/v20.11.1/node-v20.11.1-linux-armv7l.tar.xz
           tar -xf node-v20.11.1-linux-armv7l.tar.xz
           cp node-v20.11.1-linux-armv7l/bin/node nodejs_backend/bin/armeabi-v7a/libnode.so
-          chmod +x nodejs_backend/bin/arm64-v8a/libnode.so
           chmod +x nodejs_backend/bin/armeabi-v7a/libnode.so
+
           rm -rf node-v20.11.1-linux-*
+
+          # Xác nhận file tồn tại
+          ls -la nodejs_backend/bin/arm64-v8a/libnode.so
+          ls -la nodejs_backend/bin/armeabi-v7a/libnode.so
 
       - name: Install Node.js Dependencies
         run: |
@@ -119,7 +128,7 @@ jobs:
           export GRADLE_OPTS="-Xmx4096m -Dorg.gradle.daemon=false"
           export PIP_NO_BUILD_ISOLATION=1   # ← THÊM MỚI
 
-          buildozer -v android release
+          buildozer -v android release 2>&1 | tee build.log || (cat build.log | tail -100 && exit 1)
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
