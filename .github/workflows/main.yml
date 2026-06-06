@@ -5,7 +5,6 @@ on:
     branches:
       - main
   workflow_dispatch:
-  
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -25,10 +24,9 @@ jobs:
             ~/.buildozer
             .buildozer
             ~/.gradle
-          # Đổi key thành v2 để bỏ qua toàn bộ rác từ cache cũ
-          key: buildozer-zauto-v4-${{ runner.os }}-${{ github.run_id }}
+          key: buildozer-zauto-v5-${{ runner.os }}-${{ github.run_id }}
           restore-keys: |
-            buildozer-zauto-v4-${{ runner.os }}-
+            buildozer-zauto-v5-${{ runner.os }}-
 
       - name: Cleanup System
         run: |
@@ -37,7 +35,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"   # ← SỬA: bỏ .4, lấy latest 3.11.x
+          python-version: "3.11"
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -49,13 +47,11 @@ jobs:
           mkdir -p nodejs_backend/bin/arm64-v8a
           mkdir -p nodejs_backend/bin/armeabi-v7a
 
-          # arm64-v8a
           curl -LO https://nodejs.org/dist/v20.11.1/node-v20.11.1-linux-arm64.tar.xz
           tar -xf node-v20.11.1-linux-arm64.tar.xz
           cp node-v20.11.1-linux-arm64/bin/node nodejs_backend/bin/arm64-v8a/libnode.so
           chmod +x nodejs_backend/bin/arm64-v8a/libnode.so
 
-          # armeabi-v7a
           curl -LO https://nodejs.org/dist/v20.11.1/node-v20.11.1-linux-armv7l.tar.xz
           tar -xf node-v20.11.1-linux-armv7l.tar.xz
           cp node-v20.11.1-linux-armv7l/bin/node nodejs_backend/bin/armeabi-v7a/libnode.so
@@ -63,7 +59,6 @@ jobs:
 
           rm -rf node-v20.11.1-linux-*
 
-          # Xác nhận file tồn tại
           ls -la nodejs_backend/bin/arm64-v8a/libnode.so
           ls -la nodejs_backend/bin/armeabi-v7a/libnode.so
 
@@ -91,20 +86,15 @@ jobs:
 
       - name: Install Build Tools
         run: |
-          # 1. Cài đặt phiên bản pip cũ hơn để tương thích với p4a cũ (quan trọng!)
-          python -m pip install --upgrade "pip<24.0"
-          
-          # 2. Cài đặt các công cụ với phiên bản "khóa cứng" (pin version)
-          # Lưu ý: sh phải < 2.0 theo yêu cầu của python-for-android
-          pip install Cython==0.29.36 buildozer==1.5.0 "python-for-android==2024.1.21" "sh<2.0" virtualenv setuptools==68.0.0 wheel
+          python -m pip install --upgrade pip
+          pip install Cython==0.29.36 buildozer==1.5.0 "python-for-android==2024.1.21" "sh==1.14.3" virtualenv setuptools==68.0.0 wheel
 
       - name: Create required directories
         run: |
-          mkdir -p java res/xml
+          mkdir -p java_src/org/zauto res/xml
           if [ ! -f res/xml/file_paths.xml ] && [ -f file_paths.xml ]; then
             cp file_paths.xml res/xml/file_paths.xml
           fi
-          # ✅ Tạo PNG icon thật sự từ profile.jpg
           sudo apt-get install -y imagemagick
           convert profile.jpg profile_icon.png
 
@@ -123,18 +113,14 @@ jobs:
       - name: Build APK (Release)
         run: |
           mkdir -p ~/.android && touch ~/.android/repositories.cfg
-          
-          # Cấu hình biến môi trường
+
           export P4A_RELEASE_KEYSTORE=$(pwd)/zauto.keystore
           export P4A_RELEASE_KEYSTORE_PASSWD=zauto123
           export P4A_RELEASE_KEYALIAS_PASSWD=zauto123
           export P4A_RELEASE_KEYALIAS=zauto
           export GRADLE_OPTS="-Xmx4096m -Dorg.gradle.daemon=false"
           export PIP_NO_BUILD_ISOLATION=1
-          export BUILDOZER_PREFER_HOST_PIP=1
 
-          # ÉP BUILDOZER SỬ DỤNG PIP BẢN CŨ 23.3.1 (Rất ổn định cho P4A)
-          # Chúng ta sẽ cài đặt venv và ép nó dùng bản pip cũ ngay khi buildozer bắt đầu
           buildozer -v android release
 
       - name: Upload APK
@@ -142,4 +128,3 @@ jobs:
         with:
           name: ZAuto-VIP-Release-APK
           path: bin/*.apk
-        
