@@ -24,9 +24,9 @@ jobs:
             ~/.buildozer
             .buildozer
             ~/.gradle
-          key: buildozer-zauto-v5-${{ runner.os }}-${{ github.run_id }}
+          key: buildozer-zauto-v6-${{ runner.os }}-${{ github.run_id }}
           restore-keys: |
-            buildozer-zauto-v5-${{ runner.os }}-
+            buildozer-zauto-v6-${{ runner.os }}-
 
       - name: Cleanup System
         run: |
@@ -88,6 +88,14 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install Cython==0.29.36 buildozer==1.5.0 "python-for-android==2024.1.21" "sh==1.14.3" virtualenv setuptools==68.0.0 wheel
+
+      - name: Patch P4A — Fix venv pip resolvelib bug
+        run: |
+          P4A_BUILD=$(python -c "import pythonforandroid; import os; print(os.path.join(os.path.dirname(pythonforandroid.__file__), 'build.py'))")
+          echo "Patching: $P4A_BUILD"
+          sed -i "s/pip install -U pip/pip install 'pip==23.3.1'/g" "$P4A_BUILD"
+          echo "--- Verified patch ---"
+          grep -n "pip install" "$P4A_BUILD" | head -10
 
       - name: Create required directories
         run: |
