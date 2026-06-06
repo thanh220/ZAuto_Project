@@ -38,7 +38,7 @@ android.minapi = 24
 android.ndk = 25b
 
 android.accept_sdk_license = True
-android.archs = arm64-v8a
+android.archs = arm64-v8a, armeabi-v7a
 
 # Khai báo libnode.so cho từng loại chip
 android.add_libs_arm64_v8a = nodejs_backend/bin/arm64-v8a/libnode.so
@@ -57,7 +57,6 @@ android.enable_androidx = True
 # =====================================================
 # JAVA / RES
 # =====================================================
-android.add_java_dir = java
 android.add_src = java_src
 android.add_res = ./res
 
