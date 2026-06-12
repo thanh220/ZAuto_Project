@@ -798,9 +798,9 @@ class RideCard(MDCard):
     time_text = StringProperty()
 class ZAutoHybridVisionEngine:
     def __init__(self):
-        # Thiết lập dải phổ màu HSV nhận diện nền bong bóng chat của Zalo
-        self.lower_bound = np.array([0, 0, 200])
-        self.upper_bound = np.array([180, 30, 255])
+        # LAZY INIT: Không dùng np ở đây — tránh crash khi numpy chưa được cài
+        self.lower_bound = [0, 0, 200]
+        self.upper_bound = [180, 30, 255]
 
     def process_screenshot_and_double_click(self, screenshot_path):
         """
@@ -808,15 +808,26 @@ class ZAutoHybridVisionEngine:
         cạnh bong bóng chat cuối cùng để phát lệnh click đúp vật lý.
         """
         try:
+            # LAZY IMPORT: Chỉ import khi thật sự cần, không crash app khi thiếu thư viện
+            try:
+                import cv2
+                import numpy as np
+            except ImportError:
+                logger.warning("OpenCV/numpy chưa cài — Vision Engine bị tắt tự động")
+                return False
+
             if not os.path.exists(screenshot_path): return False
             
+            lb = np.array(self.lower_bound)
+            ub = np.array(self.upper_bound)
+
             # Đọc ảnh chụp màn hình thô
             img = cv2.imread(screenshot_path)
             if img is None: return False
             
             height, width, _ = img.shape
             hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-            mask = cv2.inRange(hsv, self.lower_bound, self.upper_bound)
+            mask = cv2.inRange(hsv, lb, ub)
             
             # Quét tìm các đa giác biên (Contours) của tin nhắn hiển thị trên màn hình
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -857,13 +868,13 @@ class ZAutoHybridVisionEngine:
             # CRITICAL OPTIMIZATION: GIẢI PHÓNG BỘ NHỚ MA TRẬN ẢNH TỨC THÌ
             # ==============================================================
             del img, hsv, mask, contours
-            gc.collect() 
+            gc.collect()
             
             return success
                 
         except Exception as e:
             logger.error(f"Lỗi động cơ thị giác Vision Engine: {e}")
-            gc.collect() # Dọn dẹp cả khi có lỗi
+            gc.collect()
         return False
     
 class ZAutoProApp(MDApp):
@@ -934,20 +945,28 @@ class ZAutoProApp(MDApp):
     def on_start(self):
         try:
             init_db()
-            
-            # CHỈNH SỬA 1: Gọi hàm start_node_server thông qua self.
             threading.Thread(target=self.start_node_server, daemon=True).start()
-            
-            # CHỈNH SỬA 2: Trì hoãn load cấu hình 0.2 giây để tránh lỗi SQLite Load ids
             Clock.schedule_once(lambda dt: self.delayed_ui_startup(), 0.2)
-            
+
+            # KHỞI ĐỘNG WORKER CHO CẢ PC LẪN ANDROID — không bị kẹt queue khi test PC
+            self.msg_worker_thread = threading.Thread(target=self._message_worker, daemon=True)
+            self.msg_worker_thread.start()
+            self.reply_worker_thread = threading.Thread(target=self._reply_worker_loop, daemon=True)
+            self.reply_worker_thread.start()
+            self.audio_worker_thread = threading.Thread(target=self._audio_worker_loop, daemon=True)
+            self.audio_worker_thread.start()
+            self.poll_worker_thread = threading.Thread(target=self._java_poll_worker, daemon=True)
+            self.poll_worker_thread.start()
+
+            Clock.schedule_interval(self._system_watchdog, 180)
+            Clock.schedule_interval(self._process_ui_queue, 0.1)
+
             if platform == 'android':
                 try:
                     ActivityInfo = autoclass('android.content.pm.ActivityInfo')
                     PythonActivity.mActivity.setRequestedOrientation(
                         ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
                     )
-
                     request_permissions([Permission.INTERNET, Permission.ACCESS_FINE_LOCATION, Permission.POST_NOTIFICATIONS])
                     _fgIntent = autoclass('android.content.Intent')(PythonActivity.mActivity, autoclass('org.zauto.ZaloForegroundService'))
                     PythonActivity.mActivity.startForegroundService(_fgIntent)
@@ -967,29 +986,6 @@ class ZAutoProApp(MDApp):
                     if not self.wifilock.isHeld():
                         self.wifilock.acquire()
 
-                    # KHỞI TẠO KIẾN TRÚC REALTIME
-                    self.processed_msg_hashes = LRUCache(maxsize=1000)
-                    self.global_last_reply = 0
-                    self.last_reply_time = LRUCache(maxsize=200)
-
-                    # 1. KÍCH HOẠT LUỒNG LẮNG NGHE TIN NHẮN
-                    self.msg_worker_thread = threading.Thread(target=self._message_worker, daemon=True)
-                    self.msg_worker_thread.start()
-
-                    # 2. KÍCH HOẠT LUỒNG TRẢ LỜI TIN NHẮN
-                    self.reply_worker_thread = threading.Thread(target=self._reply_worker_loop, daemon=True)
-                    self.reply_worker_thread.start()
-
-                    # 3. KÍCH HOẠT LUỒNG XẾP HÀNG PHÁT TIN THOẠI
-                    self.audio_worker_thread = threading.Thread(target=self._audio_worker_loop, daemon=True)
-                    self.audio_worker_thread.start()
-
-                    Clock.schedule_interval(self._system_watchdog, 180)
-                    Clock.schedule_interval(self._process_ui_queue, 0.1)
-
-                    # KÍCH HOẠT LUỒNG NGẦM HÚT TIN VÀ NUÔI WATCHDOG TRẮNG ĐÊM
-                    self.poll_worker_thread = threading.Thread(target=self._java_poll_worker, daemon=True)
-                    self.poll_worker_thread.start()
                 except Exception as e:
                     logger.error(f"Lỗi cấu hình phần cứng Android: {e}")
 
@@ -1456,13 +1452,20 @@ class ZAutoProApp(MDApp):
                 except queue.Full: pass
 
     def _system_watchdog(self, dt):
-        """Khôi phục Worker, Tối ưu RAM và chặn nhân bản Thread"""
+        """Khôi phục Worker, Tối ưu RAM, chặn nhân bản Thread và kiểm tra Node.js"""
         self.gc_counter += 1
-        if self.gc_counter % 10 == 0: # Ép xả RAM mức 2 định kỳ
+        if self.gc_counter % 10 == 0:
             try: gc.collect(2)
             except: pass
-            
+
         if not getattr(self, 'app_running', False): return
+
+        # KIỂM TRA NODE.JS CÒN SỐNG KHÔNG — tự restart nếu chết
+        try:
+            urllib.request.urlopen("http://127.0.0.1:3000/health", timeout=2)
+        except Exception:
+            logger.warning("Node.js không phản hồi — đang restart...")
+            threading.Thread(target=self.start_node_server, daemon=True).start()
 
         with self.worker_restart_lock:
             if not hasattr(self, 'msg_worker_thread') or not self.msg_worker_thread.is_alive():
@@ -1478,6 +1481,12 @@ class ZAutoProApp(MDApp):
                     self.reply_worker_thread = threading.Thread(target=self._reply_worker_loop, daemon=True)
                     self.reply_worker_thread.start()
                     self._restarting_reply_worker = False
+
+            # THÊM: Kiểm tra audio_worker — cũng cần sống liên tục
+            if not hasattr(self, 'audio_worker_thread') or not self.audio_worker_thread.is_alive():
+                self.audio_worker_thread = threading.Thread(target=self._audio_worker_loop, daemon=True)
+                self.audio_worker_thread.start()
+                logger.warning("audio_worker đã được restart")
     def log_history(self, group, msg):
         # Dùng List chuẩn Material của KivyMD
         item = TwoLineAvatarIconListItem(text=f"[{time.strftime('%H:%M')}] {group}", secondary_text=msg)
@@ -2095,16 +2104,15 @@ class ZAutoProApp(MDApp):
 
         try:
             from jnius import autoclass
-            File       = autoclass('java.io.File')
-            Intent     = autoclass('android.content.Intent')
-            Build      = autoclass('android.os.Build')
-            activity   = PythonActivity.mActivity
-            pkg        = activity.getPackageName()
-            apk_file   = File(apk_path)
+            File         = autoclass('java.io.File')
+            IntentClass  = autoclass('android.content.Intent')
+            Build        = autoclass('android.os.Build')
+            activity     = PythonActivity.mActivity
+            pkg          = activity.getPackageName()
+            apk_file     = File(apk_path)
 
             if Build.VERSION.SDK_INT >= 24:
                 FileProvider = autoclass('androidx.core.content.FileProvider')
-                # Authority khớp chuẩn với buildozer p4a default
                 authority = f"{pkg}.fileprovider"
                 try:
                     uri = FileProvider.getUriForFile(activity, authority, apk_file)
@@ -2114,21 +2122,22 @@ class ZAutoProApp(MDApp):
                 Uri = autoclass('android.net.Uri')
                 uri = Uri.fromFile(apk_file)
 
-            intent = Intent(Intent.ACTION_VIEW)
-            intent.setDataAndType(uri, "application/vnd.android.package-archive")
-            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            # Tạo intent cài APK — dùng IntentClass để không bị ghi đè
+            install_intent = IntentClass(IntentClass.ACTION_VIEW)
+            install_intent.setDataAndType(uri, "application/vnd.android.package-archive")
+            install_intent.addFlags(IntentClass.FLAG_GRANT_READ_URI_PERMISSION)
+            install_intent.addFlags(IntentClass.FLAG_ACTIVITY_NEW_TASK)
+            install_intent.addFlags(IntentClass.FLAG_ACTIVITY_CLEAR_TOP)
 
-            # Giữ Foreground Service sống trước khi nhường màn hình cho installer
+            # Giữ Foreground Service sống — dùng tên biến KHÁC để không ghi đè install_intent
             try:
-                Intent = autoclass('android.content.Intent')
-                ZaloForegroundService = autoclass('org.zauto.ZaloForegroundService')
-                intent = Intent(PythonActivity.mActivity, ZaloForegroundService)
-                PythonActivity.mActivity.startForegroundService(intent)
+                _FgSvc = autoclass('org.zauto.ZaloForegroundService')
+                _fg_intent = IntentClass(PythonActivity.mActivity, _FgSvc)
+                PythonActivity.mActivity.startForegroundService(_fg_intent)
             except: pass
 
-            activity.startActivity(intent)
+            # Chạy đúng intent cài APK (không bị ghi đè)
+            activity.startActivity(install_intent)
             logger.info("Đã mở màn hình cài đặt APK")
 
             Clock.schedule_once(lambda dt: self._update_popup.dismiss()
@@ -2137,7 +2146,6 @@ class ZAutoProApp(MDApp):
         except Exception as e:
             err = traceback.format_exc()
             logger.error(f"Lỗi _install_apk:\n{err}")
-            # Hiện lỗi lên label thay vì toast rồi dismiss
             Clock.schedule_once(lambda dt: setattr(
                 self._update_progress_label, 'text', f"❌ Cài đặt lỗi: {str(e)[:100]}"), 0)
        
@@ -2354,7 +2362,12 @@ class ZAutoProApp(MDApp):
             if platform == 'android':
                 from jnius import autoclass
                 Build = autoclass('android.os.Build')
-                abi = Build.SUPPORTED_ABIS[0]
+                # FIX: Cast Java String[] đúng cách, ưu tiên arm64-v8a
+                try:
+                    abis = [str(Build.SUPPORTED_ABIS[i]) for i in range(Build.SUPPORTED_ABIS.length)]
+                except Exception:
+                    abis = ['arm64-v8a']
+                abi = 'arm64-v8a' if 'arm64-v8a' in abis else abis[0]
                 node_bin = os.path.join(base, 'nodejs_backend', 'bin', abi, 'libnode.so')
             else:
                 node_bin = 'node'  # Chạy trên PC bằng Node cài sẵn
@@ -2394,7 +2407,7 @@ class ZAutoProApp(MDApp):
             threading.Thread(target=log_stream, args=(proc.stderr, 'Node-Err'), daemon=True).start()
 
         except Exception as e:
-            logger.error(f'Lỗi nghiêm trọng khi khởi động Node server: {e}')            
+            logger.error(f'Lỗi nghiêm trọng khi khởi động Node server: {e}')
     
     def check_for_update(self):
         """Hàm tự động gửi yêu cầu kiểm tra phiên bản từ server Gist"""
