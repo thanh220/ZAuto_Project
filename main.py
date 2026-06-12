@@ -944,7 +944,8 @@ class ZAutoProApp(MDApp):
                 )
 
                 request_permissions([Permission.INTERNET, Permission.ACCESS_FINE_LOCATION, Permission.POST_NOTIFICATIONS])
-                autoclass('org.zauto.ZaloForegroundService').startService(PythonActivity.mActivity)
+                _fgIntent = autoclass('android.content.Intent')(PythonActivity.mActivity, autoclass('org.zauto.ZaloForegroundService'))
+                PythonActivity.mActivity.startForegroundService(_fgIntent)
 
                 # ÉP CPU KHÔNG NGỦ (MỨC 1)
                 PowerManager = autoclass('android.os.PowerManager')
@@ -1058,7 +1059,7 @@ class ZAutoProApp(MDApp):
         trial_expire = 0
 
         # Đường dẫn file backup ẩn ở phân vùng dùng chung (Không bị xóa khi gỡ cài đặt app)
-        backup_dir = "/sdcard/Android/media/org.zauto.taxi/"
+        backup_dir = "/sdcard/Android/media/org.zauto.zauto/"
         backup_file = os.path.join(backup_dir, ".sys_secure_node.dat")
 
         # Đọc dữ liệu dùng thử từ 3 nguồn để đối chiếu chéo (Local App, SharedPreferences, Backup SDCard)
@@ -1862,7 +1863,7 @@ class ZAutoProApp(MDApp):
                 context = PythonActivity.mActivity
                 resolver = context.getContentResolver()
                 
-                # Lấy package name hiện tại (org.zauto.taxi)
+                # Lấy package name hiện tại (org.zauto.zauto)
                 pkg_name = context.getPackageName() 
                 
                 acc_granted = False
@@ -2096,7 +2097,10 @@ class ZAutoProApp(MDApp):
 
             # Giữ Foreground Service sống trước khi nhường màn hình cho installer
             try:
-                autoclass('org.zauto.ZaloForegroundService').startService(activity)
+                Intent = autoclass('android.content.Intent')
+                ZaloForegroundService = autoclass('org.zauto.ZaloForegroundService')
+                intent = Intent(PythonActivity.mActivity, ZaloForegroundService)
+                PythonActivity.mActivity.startForegroundService(intent)
             except: pass
 
             activity.startActivity(intent)
