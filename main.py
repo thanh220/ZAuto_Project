@@ -865,6 +865,7 @@ class ZAutoHybridVisionEngine:
             logger.error(f"Lỗi động cơ thị giác Vision Engine: {e}")
             gc.collect() # Dọn dẹp cả khi có lỗi
         return False
+    
 class ZAutoProApp(MDApp):
     # ==========================================
     # QUẢN LÝ PHIÊN BẢN (TĂNG SỐ NÀY LÊN MỖI LẦN BUILD MỚI)
@@ -932,69 +933,79 @@ class ZAutoProApp(MDApp):
 
     def on_start(self):
         try:
-            # 1. Khởi tạo cơ sở dữ liệu (Không ảnh hưởng giao diện UI)
             init_db()
             
-            # 2. Khởi động Node.js server độc lập bằng luồng ngầm
-            threading.Thread(target=start_node_server, daemon=True).start()
+            # CHỈNH SỬA 1: Gọi hàm start_node_server thông qua self.
+            threading.Thread(target=self.start_node_server, daemon=True).start()
             
-            # 3. SỬA LỖI SQLite Load (NoneType object has no attribute ids):
-            # Trì hoãn việc đọc cấu hình UI chậm hơn 0.2 giây để Kivy kịp thời vẽ xong cấu trúc layout gốc.
+            # CHỈNH SỬA 2: Trì hoãn load cấu hình 0.2 giây để tránh lỗi SQLite Load ids
             Clock.schedule_once(lambda dt: self.delayed_ui_startup(), 0.2)
             
-            # 4. Giữ nguyên toàn bộ logic phần cứng Android cốt lõi của bạn
             if platform == 'android':
-                # KHÓA MÀN HÌNH DỌC - CHỐNG XOAY NGANG
-                ActivityInfo = autoclass('android.content.pm.ActivityInfo')
-                PythonActivity.mActivity.setRequestedOrientation(
-                    ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-                )
+                try:
+                    ActivityInfo = autoclass('android.content.pm.ActivityInfo')
+                    PythonActivity.mActivity.setRequestedOrientation(
+                        ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                    )
 
-                request_permissions([Permission.INTERNET, Permission.ACCESS_FINE_LOCATION, Permission.POST_NOTIFICATIONS])
-                _fgIntent = autoclass('android.content.Intent')(PythonActivity.mActivity, autoclass('org.zauto.ZaloForegroundService'))
-                PythonActivity.mActivity.startForegroundService(_fgIntent)
+                    request_permissions([Permission.INTERNET, Permission.ACCESS_FINE_LOCATION, Permission.POST_NOTIFICATIONS])
+                    _fgIntent = autoclass('android.content.Intent')(PythonActivity.mActivity, autoclass('org.zauto.ZaloForegroundService'))
+                    PythonActivity.mActivity.startForegroundService(_fgIntent)
 
-                # ÉP CPU KHÔNG NGỦ (MỨC 1)
-                PowerManager = autoclass('android.os.PowerManager')
-                Context = autoclass('android.content.Context')
-                pm = cast(PowerManager, PythonActivity.mActivity.getSystemService(Context.POWER_SERVICE))
-                self.wakelock = pm.newWakeLock(1, "ZAuto::WakeLockCore")
-                if not self.wakelock.isHeld():
-                    self.wakelock.acquire()
+                    # ÉP CPU KHÔNG NGỦ (MỨC 1)
+                    PowerManager = autoclass('android.os.PowerManager')
+                    Context = autoclass('android.content.Context')
+                    pm = cast(PowerManager, PythonActivity.mActivity.getSystemService(Context.POWER_SERVICE))
+                    self.wakelock = pm.newWakeLock(1, "ZAuto::WakeLockCore")
+                    if not self.wakelock.isHeld():
+                        self.wakelock.acquire()
 
-                # ÉP WIFI KHÔNG ĐƯỢC NGẮT (MỨC 3 - HIGH PERFORMANCE)
-                WifiManager = autoclass('android.net.wifi.WifiManager')
-                wm = cast(WifiManager, PythonActivity.mActivity.getApplicationContext().getSystemService(Context.WIFI_SERVICE))
-                self.wifilock = wm.createWifiLock(3, "ZAuto::WifiLockCore")
-                if not self.wifilock.isHeld():
-                    self.wifilock.acquire()
+                    # ÉP WIFI KHÔNG ĐƯỢC NGẮT (MỨC 3 - HIGH PERFORMANCE)
+                    WifiManager = autoclass('android.net.wifi.WifiManager')
+                    wm = cast(WifiManager, PythonActivity.mActivity.getApplicationContext().getSystemService(Context.WIFI_SERVICE))
+                    self.wifilock = wm.createWifiLock(3, "ZAuto::WifiLockCore")
+                    if not self.wifilock.isHeld():
+                        self.wifilock.acquire()
 
-                # KHỞI TẠO KIẾN TRÚC REALTIME
-                self.processed_msg_hashes = LRUCache(maxsize=1000)
-                self.global_last_reply = 0
-                self.last_reply_time = LRUCache(maxsize=200)
+                    # KHỞI TẠO KIẾN TRÚC REALTIME
+                    self.processed_msg_hashes = LRUCache(maxsize=1000)
+                    self.global_last_reply = 0
+                    self.last_reply_time = LRUCache(maxsize=200)
 
-                # 1. KÍCH HOẠT LUỒNG LẮNG NGHE TIN NHẮN
-                self.msg_worker_thread = threading.Thread(target=self._message_worker, daemon=True)
-                self.msg_worker_thread.start()
+                    # 1. KÍCH HOẠT LUỒNG LẮNG NGHE TIN NHẮN
+                    self.msg_worker_thread = threading.Thread(target=self._message_worker, daemon=True)
+                    self.msg_worker_thread.start()
 
-                # 2. KÍCH HOẠT LUỒNG TRẢ LỜI TIN NHẮN
-                self.reply_worker_thread = threading.Thread(target=self._reply_worker_loop, daemon=True)
-                self.reply_worker_thread.start()
+                    # 2. KÍCH HOẠT LUỒNG TRẢ LỜI TIN NHẮN
+                    self.reply_worker_thread = threading.Thread(target=self._reply_worker_loop, daemon=True)
+                    self.reply_worker_thread.start()
 
-                # 3. KÍCH HOẠT LUỒNG XẾP HÀNG PHÁT TIN THOẠI
-                self.audio_worker_thread = threading.Thread(target=self._audio_worker_loop, daemon=True)
-                self.audio_worker_thread.start()
+                    # 3. KÍCH HOẠT LUỒNG XẾP HÀNG PHÁT TIN THOẠI
+                    self.audio_worker_thread = threading.Thread(target=self._audio_worker_loop, daemon=True)
+                    self.audio_worker_thread.start()
 
-                Clock.schedule_interval(self._system_watchdog, 180)
-                Clock.schedule_interval(self._process_ui_queue, 0.1)
+                    Clock.schedule_interval(self._system_watchdog, 180)
+                    Clock.schedule_interval(self._process_ui_queue, 0.1)
 
-                # KÍCH HOẠT LUỒNG NGẦM HÚT TIN VÀ NUÔI WATCHDOG TRẮNG ĐÊM
-                self.poll_worker_thread = threading.Thread(target=self._java_poll_worker, daemon=True)
-                self.poll_worker_thread.start()
+                    # KÍCH HOẠT LUỒNG NGẦM HÚT TIN VÀ NUÔI WATCHDOG TRẮNG ĐÊM
+                    self.poll_worker_thread = threading.Thread(target=self._java_poll_worker, daemon=True)
+                    self.poll_worker_thread.start()
+                except Exception as e:
+                    logger.error(f"Lỗi cấu hình phần cứng Android: {e}")
 
         except Exception as e:
             logger.error(f"Lỗi on_start: {traceback.format_exc()}")
+
+    def delayed_ui_startup(self):
+        """Hàm bổ sung: Đợi giao diện sẵn sàng rồi mới nạp cấu hình cài đặt (Thụt lề 4 dấu cách)"""
+        try:
+            self.load_config()
+            self.check_license_at_startup()
+            self.check_for_update()
+            logger.info("Đã nạp thành công cấu hình UI và kiểm tra bản quyền.")
+        except Exception as e:
+            logger.error(f"Lỗi nạp UI chậm: {e}")
+          
     def update_group_list_ui(self, groups):
         """Cập nhật danh sách nhóm từ Zalo Web lên giao diện Tab Nhóm"""
         try:
@@ -1785,6 +1796,13 @@ class ZAutoProApp(MDApp):
             self.is_linked = self.config_data.get('is_linked', False)
             self.enabled_groups = self.config_data.get('enabled_groups', {})
 
+            # ─────────────────────────────────────────────────────────────────
+            # XOÁ LỖI TỪ GỐC: Nếu giao diện chưa dựng xong, thoát sớm để tránh crash .ids
+            # ─────────────────────────────────────────────────────────────────
+            if not getattr(self, 'root', None) or self.root is None:
+                logger.info("Cấu hình đã nạp vào bộ nhớ đệm ngầm (Giao diện UI sẽ cập nhật sau).")
+                return
+
             ids = self.root.ids
             if ids.get('inp_nhan'): ids.inp_nhan.text = self.config_data.get('nhan', '')
             if ids.get('inp_loai'): ids.inp_loai.text = self.config_data.get('loai', '')
@@ -2327,74 +2345,57 @@ class ZAutoProApp(MDApp):
 
             except Exception as e:
                 logger.error(f"Lỗi dọn dẹp on_stop: {e}")
-    def start_node_server():
-        """Khởi động Node.js backend server.js bằng libnode.so trên Android hoặc node trên PC/Windows"""
+    def start_node_server(self):
+        """Khởi động Node.js backend server.js (Hỗ trợ cả PC Windows và Android)"""
         import subprocess
         import os
-        
         try:
             base = os.path.dirname(os.path.abspath(__file__))
-            
-            # 1. Xác định file chạy node binary dựa trên nền tảng hệ điều hành
             if platform == 'android':
                 from jnius import autoclass
                 Build = autoclass('android.os.Build')
-                abi = Build.SUPPORTED_ABIS[0]  # arm64-v8a hoặc armeabi-v7a
+                abi = Build.SUPPORTED_ABIS[0]
                 node_bin = os.path.join(base, 'nodejs_backend', 'bin', abi, 'libnode.so')
             else:
-                node_bin = 'node'  # Khi test trên PC dùng Node cài sẵn trong máy
+                node_bin = 'node'  # Chạy trên PC bằng Node cài sẵn
 
             server_script = os.path.join(base, 'nodejs_backend', 'server.js')
             node_cwd = os.path.join(base, 'nodejs_backend')
 
-            # 2. Kiểm tra sự tồn tại và cấp quyền chạy binary trên Android
             if platform == 'android':
                 if not os.path.exists(node_bin):
                     logger.error(f'Không tìm thấy node binary tại: {node_bin}')
                     return
-                
-                # Cấp quyền thực thi cho file libnode.so tránh lỗi Permission Denied khi chạy trên Android
-                try:
-                    os.chmod(node_bin, 0o755)
-                except Exception as e_chmod:
-                    logger.warning(f'Không thể set chmod cho node binary: {e_chmod}')
+                try: os.chmod(node_bin, 0o755)
+                except: pass
 
-            # 3. Thiết lập biến môi trường để Node tìm thấy thư mục node_modules chính xác
             env = os.environ.copy()
             env['NODE_PATH'] = os.path.join(node_cwd, 'node_modules')
-
-            # 4. Kích hoạt Popen đặc thù theo hệ điều hành (Windows cần shell=True)
             is_windows = os.name == 'nt' and platform != 'android'
 
             proc = subprocess.Popen(
                 [node_bin, server_script],
-                cwd=node_cwd,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                cwd=node_cwd, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 shell=True if is_windows else False
             )
             logger.info(f'Node.js server đã khởi động ngầm thành công, PID={proc.pid}')
 
-            # Hàm đọc luồng log tránh đầy bộ đệm (Buffer Overflow) gây treo Node
+            # Đọc luồng dữ liệu log tránh đầy bộ đệm treo tiến trình
             def log_stream(stream, prefix):
                 try:
                     for line in iter(stream.readline, b''):
                         msg = line.decode('utf-8', errors='ignore').strip()
-                        if msg:
-                            logger.info(f'[{prefix}] {msg}')
-                except Exception:
-                    pass
-                finally:
-                    stream.close()
+                        if msg: logger.info(f'[{prefix}] {msg}')
+                except: pass
+                finally: stream.close()
 
-            # Tạo luồng gom log từ server.js đẩy thẳng vào màn hình debug/log của Kivy
-            import threading
             threading.Thread(target=log_stream, args=(proc.stdout, 'Node-Out'), daemon=True).start()
             threading.Thread(target=log_stream, args=(proc.stderr, 'Node-Err'), daemon=True).start()
 
         except Exception as e:
-            logger.error(f'Lỗi nghiêm trọng khi khởi động Node server: {e}')
+            logger.error(f'Lỗi nghiêm trọng khi khởi động Node server: {e}')            
+    
     def check_for_update(self):
         """Hàm tự động gửi yêu cầu kiểm tra phiên bản từ server Gist"""
         def on_success(req, result):
