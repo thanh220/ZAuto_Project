@@ -8,8 +8,8 @@ package.domain = org.zauto
 source.dir = .
 
 source.include_exts = py,png,jpg,kv,atlas,js,json,ttf,otf,so
-source.include_patterns = nodejs_backend/*, nodejs_backend/node_modules/**/*version = 7.0
-
+source.include_patterns = nodejs_backend/*, nodejs_backend/node_modules/**/*
+version = 7.0
 orientation = portrait
 fullscreen = 0
 
