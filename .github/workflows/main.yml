@@ -125,20 +125,20 @@ jobs:
 
       - name: Build APK (Release)
         run: |
-          # 1. Clean cache nếu có lỗi từ lần build trước
-          buildozer clean
+          # 1. Thay vì dùng 'buildozer clean', ta xóa thủ công các thư mục build cũ
+          # Điều này đảm bảo sạch sẽ hoàn toàn mà không cần buildozer nhận diện lệnh
+          rm -rf .buildozer/android/platform/build-arm64-v8a_armeabi-v7a/build
+          rm -rf .buildozer/android/platform/python-for-android
           
           mkdir -p ~/.android && touch ~/.android/repositories.cfg
 
-          # 2. Thay vì patch pip, hãy để Buildozer dùng pip mặc định của nó
-          # Và tăng giới hạn bộ nhớ cho Gradle
           export P4A_RELEASE_KEYSTORE=$(pwd)/zauto.keystore
           export P4A_RELEASE_KEYSTORE_PASSWD=zauto123
           export P4A_RELEASE_KEYALIAS_PASSWD=zauto123
           export P4A_RELEASE_KEYALIAS=zauto
           export GRADLE_OPTS="-Xmx4096m -Dorg.gradle.daemon=false"
           
-          # 3. Chạy build
+          # 2. Build trực tiếp
           buildozer -v android release
 
       - name: Upload APK
