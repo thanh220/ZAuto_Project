@@ -92,8 +92,10 @@ jobs:
 
       - name: Install Build Tools
         run: |
-          python -m pip install --upgrade pip
-          pip install Cython==0.29.36 buildozer==1.5.0 "python-for-android==2024.1.21" virtualenv setuptools wheel "resolvelib>=1.0.1"
+          # Cài đặt phiên bản pip cố định, không dùng bản mới nhất
+          python -m pip install --upgrade "pip==23.2.1"
+          # Chỉ cài đặt những thứ cần thiết, tránh cài resolvelib quá mới
+          pip install Cython==0.29.36 buildozer==1.5.0
 
       - name: Patch P4A pip inside venv fix
         run: |
@@ -125,20 +127,17 @@ jobs:
 
       - name: Build APK (Release)
         run: |
-          # 1. Thay vì dùng 'buildozer clean', ta xóa thủ công các thư mục build cũ
-          # Điều này đảm bảo sạch sẽ hoàn toàn mà không cần buildozer nhận diện lệnh
-          rm -rf .buildozer/android/platform/build-arm64-v8a_armeabi-v7a/build
-          rm -rf .buildozer/android/platform/python-for-android
-          
-          mkdir -p ~/.android && touch ~/.android/repositories.cfg
-
           export P4A_RELEASE_KEYSTORE=$(pwd)/zauto.keystore
           export P4A_RELEASE_KEYSTORE_PASSWD=zauto123
           export P4A_RELEASE_KEYALIAS_PASSWD=zauto123
           export P4A_RELEASE_KEYALIAS=zauto
           export GRADLE_OPTS="-Xmx4096m -Dorg.gradle.daemon=false"
+          # CHÌA KHÓA: Chặn việc kiểm tra phiên bản pip
+          export PIP_DISABLE_PIP_VERSION_CHECK=1
           
-          # 2. Build trực tiếp
+          # Xóa cache venv trước khi chạy để tránh lỗi cũ
+          rm -rf .buildozer/android/platform/build-arm64-v8a_armeabi-v7a/build/venv
+          
           buildozer -v android release
 
       - name: Upload APK
