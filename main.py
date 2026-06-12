@@ -931,12 +931,19 @@ class ZAutoProApp(MDApp):
         return self.root
 
     def on_start(self):
-        init_db()
-        self.load_config()
-        self.check_license_at_startup()
-        self.check_for_update()
-        if platform == 'android':
-            try:
+        try:
+            # 1. Khởi tạo cơ sở dữ liệu (Không ảnh hưởng giao diện UI)
+            init_db()
+            
+            # 2. Khởi động Node.js server độc lập bằng luồng ngầm
+            threading.Thread(target=start_node_server, daemon=True).start()
+            
+            # 3. SỬA LỖI SQLite Load (NoneType object has no attribute ids):
+            # Trì hoãn việc đọc cấu hình UI chậm hơn 0.2 giây để Kivy kịp thời vẽ xong cấu trúc layout gốc.
+            Clock.schedule_once(lambda dt: self.delayed_ui_startup(), 0.2)
+            
+            # 4. Giữ nguyên toàn bộ logic phần cứng Android cốt lõi của bạn
+            if platform == 'android':
                 # KHÓA MÀN HÌNH DỌC - CHỐNG XOAY NGANG
                 ActivityInfo = autoclass('android.content.pm.ActivityInfo')
                 PythonActivity.mActivity.setRequestedOrientation(
@@ -986,8 +993,8 @@ class ZAutoProApp(MDApp):
                 self.poll_worker_thread = threading.Thread(target=self._java_poll_worker, daemon=True)
                 self.poll_worker_thread.start()
 
-            except Exception as e:
-                logger.error(f"Lỗi on_start: {traceback.format_exc()}")
+        except Exception as e:
+            logger.error(f"Lỗi on_start: {traceback.format_exc()}")
     def update_group_list_ui(self, groups):
         """Cập nhật danh sách nhóm từ Zalo Web lên giao diện Tab Nhóm"""
         try:
@@ -2320,6 +2327,74 @@ class ZAutoProApp(MDApp):
 
             except Exception as e:
                 logger.error(f"Lỗi dọn dẹp on_stop: {e}")
+    def start_node_server():
+        """Khởi động Node.js backend server.js bằng libnode.so trên Android hoặc node trên PC/Windows"""
+        import subprocess
+        import os
+        
+        try:
+            base = os.path.dirname(os.path.abspath(__file__))
+            
+            # 1. Xác định file chạy node binary dựa trên nền tảng hệ điều hành
+            if platform == 'android':
+                from jnius import autoclass
+                Build = autoclass('android.os.Build')
+                abi = Build.SUPPORTED_ABIS[0]  # arm64-v8a hoặc armeabi-v7a
+                node_bin = os.path.join(base, 'nodejs_backend', 'bin', abi, 'libnode.so')
+            else:
+                node_bin = 'node'  # Khi test trên PC dùng Node cài sẵn trong máy
+
+            server_script = os.path.join(base, 'nodejs_backend', 'server.js')
+            node_cwd = os.path.join(base, 'nodejs_backend')
+
+            # 2. Kiểm tra sự tồn tại và cấp quyền chạy binary trên Android
+            if platform == 'android':
+                if not os.path.exists(node_bin):
+                    logger.error(f'Không tìm thấy node binary tại: {node_bin}')
+                    return
+                
+                # Cấp quyền thực thi cho file libnode.so tránh lỗi Permission Denied khi chạy trên Android
+                try:
+                    os.chmod(node_bin, 0o755)
+                except Exception as e_chmod:
+                    logger.warning(f'Không thể set chmod cho node binary: {e_chmod}')
+
+            # 3. Thiết lập biến môi trường để Node tìm thấy thư mục node_modules chính xác
+            env = os.environ.copy()
+            env['NODE_PATH'] = os.path.join(node_cwd, 'node_modules')
+
+            # 4. Kích hoạt Popen đặc thù theo hệ điều hành (Windows cần shell=True)
+            is_windows = os.name == 'nt' and platform != 'android'
+
+            proc = subprocess.Popen(
+                [node_bin, server_script],
+                cwd=node_cwd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=True if is_windows else False
+            )
+            logger.info(f'Node.js server đã khởi động ngầm thành công, PID={proc.pid}')
+
+            # Hàm đọc luồng log tránh đầy bộ đệm (Buffer Overflow) gây treo Node
+            def log_stream(stream, prefix):
+                try:
+                    for line in iter(stream.readline, b''):
+                        msg = line.decode('utf-8', errors='ignore').strip()
+                        if msg:
+                            logger.info(f'[{prefix}] {msg}')
+                except Exception:
+                    pass
+                finally:
+                    stream.close()
+
+            # Tạo luồng gom log từ server.js đẩy thẳng vào màn hình debug/log của Kivy
+            import threading
+            threading.Thread(target=log_stream, args=(proc.stdout, 'Node-Out'), daemon=True).start()
+            threading.Thread(target=log_stream, args=(proc.stderr, 'Node-Err'), daemon=True).start()
+
+        except Exception as e:
+            logger.error(f'Lỗi nghiêm trọng khi khởi động Node server: {e}')
     def check_for_update(self):
         """Hàm tự động gửi yêu cầu kiểm tra phiên bản từ server Gist"""
         def on_success(req, result):
