@@ -22,18 +22,31 @@ jobs:
           git clone --depth 1 --branch 1.1.1 https://github.com/kivymd/KivyMD.git _kivymd_tmp
           cp -r _kivymd_tmp/kivymd ./kivymd
           rm -rf _kivymd_tmp
-          echo "✅ KivyMD bundled OK: $(ls kivymd/ | head -5)"
+          echo "✅ KivyMD bundled: $(ls kivymd/ | head -3)"
+
+      - name: Clone P4A và patch pip venv bug
+        run: |
+          # Clone P4A 2024.1.21 về local, patch trước khi build
+          git clone --depth 1 --branch 2024.01.21 \
+            https://github.com/kivy/python-for-android.git p4a_patched
+
+          # Patch dòng "pip install -U pip" → dùng pip mới không bị lỗi resolvelib
+          BUILD_PY="p4a_patched/pythonforandroid/build.py"
+          sed -i "s/pip install -U pip/pip install 'pip==24.0'/g" "$BUILD_PY"
+
+          # Xác nhận patch
+          echo "--- Patch result ---"
+          grep -n "pip install" "$BUILD_PY"
 
       - name: Cache Buildozer
         uses: actions/cache@v4
         with:
           path: |
             ~/.buildozer
-            .buildozer
             ~/.gradle
-          key: buildozer-zauto-v7-${{ runner.os }}-${{ github.run_id }}
+          key: buildozer-zauto-v9-${{ runner.os }}-${{ github.run_id }}
           restore-keys: |
-            buildozer-zauto-v7-${{ runner.os }}-
+            buildozer-zauto-v9-${{ runner.os }}-
 
       - name: Cleanup System
         run: |
@@ -92,17 +105,10 @@ jobs:
 
       - name: Install Build Tools
         run: |
-          # Cài đặt phiên bản pip cố định, không dùng bản mới nhất
-          python -m pip install --upgrade "pip==23.2.1"
-          # Chỉ cài đặt những thứ cần thiết, tránh cài resolvelib quá mới
-          pip install Cython==0.29.36 buildozer==1.5.0
-
-      - name: Patch P4A pip inside venv fix
-        run: |
-          find ~/.buildozer -name "build.py" -path "*/pythonforandroid/*" 2>/dev/null | while read f; do
-            sed -i "s/pip install -U pip/pip install --upgrade 'pip>=24.3'/g" "$f"
-            echo "Patched: $f"
-          done || true
+          python -m pip install --upgrade pip
+          # Cài buildozer + Cython, KHÔNG cài python-for-android từ pip
+          # vì ta dùng p4a_patched local ở dưới
+          pip install Cython==0.29.36 buildozer==1.5.0 "sh==1.14.3" virtualenv setuptools==68.0.0 wheel
 
       - name: Create required directories
         run: |
@@ -127,17 +133,19 @@ jobs:
 
       - name: Build APK (Release)
         run: |
+          mkdir -p ~/.android && touch ~/.android/repositories.cfg
+
           export P4A_RELEASE_KEYSTORE=$(pwd)/zauto.keystore
           export P4A_RELEASE_KEYSTORE_PASSWD=zauto123
           export P4A_RELEASE_KEYALIAS_PASSWD=zauto123
           export P4A_RELEASE_KEYALIAS=zauto
           export GRADLE_OPTS="-Xmx4096m -Dorg.gradle.daemon=false"
-          # CHÌA KHÓA: Chặn việc kiểm tra phiên bản pip
+          export PIP_NO_BUILD_ISOLATION=1
           export PIP_DISABLE_PIP_VERSION_CHECK=1
-          
-          # Xóa cache venv trước khi chạy để tránh lỗi cũ
-          rm -rf .buildozer/android/platform/build-arm64-v8a_armeabi-v7a/build/venv
-          
+
+          # Trỏ buildozer dùng p4a đã patch local thay vì download mới
+          export P4A_SOURCE_DIR=$(pwd)/p4a_patched
+
           buildozer -v android release
 
       - name: Upload APK
