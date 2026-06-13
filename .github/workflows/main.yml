@@ -16,14 +16,6 @@ jobs:
     steps:
       - name: Checkout Source
         uses: actions/checkout@v4
-
-      - name: Bundle KivyMD 1.1.1 source into project
-        run: |
-          git clone --depth 1 --branch 1.1.1 https://github.com/kivymd/KivyMD.git _kivymd_tmp
-          cp -r _kivymd_tmp/kivymd ./kivymd
-          rm -rf _kivymd_tmp
-          echo "✅ KivyMD bundled: $(ls kivymd/ | head -3)"
-
       - name: Clone P4A và patch pip venv bug
         run: |
           git clone --depth 1 --branch v2024.01.21 \
