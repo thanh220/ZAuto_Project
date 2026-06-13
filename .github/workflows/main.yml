@@ -113,8 +113,10 @@ jobs:
           if [ ! -f res/xml/file_paths.xml ] && [ -f file_paths.xml ]; then
             cp file_paths.xml res/xml/file_paths.xml
           fi
+          # Convert profile.jpg → profile.png thật sự (PNG header hợp lệ)
           sudo apt-get install -y imagemagick
-          convert profile.jpg profile_icon.png
+          convert profile.jpg profile.png
+          echo "✅ Icon converted: $(file profile.png)"
 
       - name: Generate Keystore
         run: |
