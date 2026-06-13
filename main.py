@@ -10,6 +10,8 @@ import logging
 import urllib.request
 import urllib.error
 import traceback
+import stat
+import os
 from kivy.network.urlrequest import UrlRequest
 import webbrowser
 from logging.handlers import RotatingFileHandler
@@ -927,21 +929,50 @@ class ZAutoProApp(MDApp):
         self.save_config_silent()
         toast("Đã BẬT lọc từ khóa" if active_state else "Đã TẮT lọc từ khóa - Nhận mọi tin")        
     def build(self):
-        from kivy.core.clipboard import Clipboard # Thêm dòng này
+        # Cấp quyền cho libnode.so trước khi ứng dụng khởi chạy hoàn toàn
+        self.fix_permissions()
+        
+        from kivy.core.clipboard import Clipboard
         self.Clipboard = Clipboard
         self.icon = 'profile.jpg'
         self.theme_cls.primary_palette = "Blue"
+        
         self.config_data = {
             'nhan': '', 'loai': '', 'reply_msg': 'Ok nhận', 'gia_km': '12000',
-            'global_delay': '30', 'sw_voice': True, # Thêm sw_voice vào đây
+            'global_delay': '30', 'sw_voice': True,
             'sw_filter': False, 'sw_auto': False, 'is_linked': False
         }
-        self.last_global_reply_time = 0 # Thêm dòng này để theo dõi thời gian chốt cuối cùng
-        self.is_linked = False # Khai báo mặc định là chưa liên kết
+        
+        self.last_global_reply_time = 0
+        self.is_linked = False
+        
         self.root = Builder.load_string(KV)
         
         return self.root
-
+    def fix_permissions(self):
+        """Cấp quyền thực thi tự động cho libnode.so theo kiến trúc máy"""
+        if platform == 'android':
+            import os
+            import stat
+            import platform as sys_platform
+            
+            # Tự động lấy kiến trúc chip: aarch64 (64-bit) hoặc armv7l (32-bit)
+            arch = sys_platform.machine()
+            # Map sang tên thư mục bạn đã tạo trong nodejs_backend/bin/
+            abi = "arm64-v8a" if arch == "aarch64" else "armeabi-v7a"
+            
+            # Đường dẫn linh hoạt dựa trên ABI
+            lib_path = f"/data/data/org.zauto.zauto/files/app/nodejs_backend/bin/{abi}/libnode.so"
+            
+            if os.path.exists(lib_path):
+                try:
+                    # Cấp quyền thực thi: 0755 (rwxr-xr-x)
+                    os.chmod(lib_path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+                    print(f"✅ Đã cấp quyền cho {abi} thành công!")
+                except Exception as e:
+                    print(f"❌ Lỗi cấp quyền cho {abi}: {e}")
+            else:
+                print(f"⚠️ Không tìm thấy file tại: {lib_path}")
     def on_start(self):
         try:
             init_db()
@@ -2356,7 +2387,6 @@ class ZAutoProApp(MDApp):
     def start_node_server(self):
         """Khởi động Node.js backend server.js (Hỗ trợ cả PC Windows và Android)"""
         import subprocess
-        import os
         try:
             base = os.path.dirname(os.path.abspath(__file__))
             if platform == 'android':
