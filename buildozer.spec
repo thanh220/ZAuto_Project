@@ -8,7 +8,7 @@ package.domain = org.zauto
 source.dir = .
 
 source.include_exts = py,png,jpg,kv,atlas,js,json,ttf,otf,so
-source.include_patterns = nodejs_backend/*, nodejs_backend/node_modules/**/*
+source.include_patterns = nodejs_backend/*, nodejs_backend/node_modules/**/*,kivymd/*,kivymd/**/*
 version = 7.0
 orientation = portrait
 fullscreen = 0
@@ -20,8 +20,8 @@ presplash.color = #FFFFFF
 # =====================================================
 # PYTHON / KIVY
 # =====================================================
-# ĐÃ KHÓA CỨNG PYTHON 3.11.4 ĐỂ CHỐNG LỖI SERVER
 requirements = python3==3.11.4,hostpython3==3.11.4,kivy==2.2.1,pyjnius,pillow,requests,plyer
+
 # =====================================================
 # LOG
 # =====================================================
@@ -38,14 +38,14 @@ android.ndk = 25b
 android.accept_sdk_license = True
 android.archs = arm64-v8a, armeabi-v7a
 
-# Khai báo libnode.so cho từng loại chip
 android.add_libs_arm64_v8a = nodejs_backend/bin/arm64-v8a/libnode.so
 android.add_libs_armeabi_v7a = nodejs_backend/bin/armeabi-v7a/libnode.so
 
 # =====================================================
-# P4A
+# P4A — dùng bản đã patch pip venv bug
 # =====================================================
 p4a.bootstrap = sdl2
+p4a.source_dir = ./p4a_patched
 
 # =====================================================
 # ANDROIDX
@@ -83,18 +83,12 @@ android.manifest_queries = com.zing.zalo
 # =====================================================
 # PERMISSIONS
 # =====================================================
-android.permissions = INTERNET, WAKE_LOCK, FOREGROUND_SERVICE, FOREGROUND_SERVICE_DATA_SYNC, BIND_ACCESSIBILITY_SERVICE, BIND_NOTIFICATION_LISTENER_SERVICE
+android.permissions = INTERNET,WAKE_LOCK,FOREGROUND_SERVICE,FOREGROUND_SERVICE_DATA_SYNC,POST_NOTIFICATIONS,ACCESS_NETWORK_STATE,ACCESS_WIFI_STATE,RECEIVE_BOOT_COMPLETED,SYSTEM_ALERT_WINDOW,REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
 
 # =====================================================
 # EXTRA MANIFEST
 # =====================================================
 android.extra_manifest_application = %(source.dir)s/manifest_services.xml
-
-# =====================================================
-# SERVICES
-# =====================================================
-# ĐÃ VÔ HIỆU HÓA: Dòng này được tắt để tránh xung đột với file manifest_services.xml
-# services = ZaloForegroundService:java
 
 # =====================================================
 # OPENGL
@@ -119,13 +113,8 @@ android.skip_update = False
 # =====================================================
 # EXCLUDE
 # =====================================================
-source.exclude_dirs = venv,.venv,env,.git,.github,**pycache**,.buildozer
+source.exclude_dirs = venv,.venv,env,.git,.github,__pycache__,.buildozer,p4a_patched
 source.exclude_patterns = *.pyc,*.pyo,*.log,*.tmp
-
-# =====================================================
-# ASSETS
-# =====================================================
-# android.add_assets = .
 
 # =====================================================
 # SDL2
