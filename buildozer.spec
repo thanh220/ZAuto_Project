@@ -8,7 +8,8 @@ package.domain = org.zauto
 source.dir = .
 
 source.include_exts = py,png,jpg,kv,atlas,js,json,ttf,otf,so
-source.include_patterns = nodejs_backend/*, nodejs_backend/node_modules/**/*,kivymd/*,kivymd/**/*
+# ĐÃ SỬA: Xóa kivymd/* để Buildozer tự cài đặt qua requirements, tránh lỗi header.frag
+source.include_patterns = nodejs_backend/*, nodejs_backend/node_modules/**/*
 version = 7.0
 orientation = portrait
 fullscreen = 0
@@ -42,10 +43,10 @@ android.add_libs_arm64_v8a = nodejs_backend/bin/arm64-v8a/libnode.so
 android.add_libs_armeabi_v7a = nodejs_backend/bin/armeabi-v7a/libnode.so
 
 # =====================================================
-# P4A — dùng bản đã patch pip venv bug
+# P4A 
 # =====================================================
 p4a.bootstrap = sdl2
-p4a.source_dir = ./p4a_patched
+# ĐÃ SỬA: Xóa p4a.source_dir = ./p4a_patched để tránh xung đột môi trường build
 
 # =====================================================
 # ANDROIDX
