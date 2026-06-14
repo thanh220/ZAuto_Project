@@ -9,7 +9,7 @@ source.dir = .
 
 source.include_exts = py,png,jpg,kv,atlas,js,json,ttf,otf,so
 # ĐÃ SỬA: Xóa kivymd/* để Buildozer tự cài đặt qua requirements, tránh lỗi header.frag
-source.include_patterns = nodejs_backend/*, nodejs_backend/node_modules/**/*
+source.include_patterns = nodejs_backend/*, nodejs_backend/node_modules/**/*,kivymd/*,kivymd/**/*
 version = 7.0
 orientation = portrait
 fullscreen = 0
@@ -21,7 +21,7 @@ presplash.color = #FFFFFF
 # =====================================================
 # PYTHON / KIVY
 # =====================================================
-requirements = python3==3.11.4,hostpython3==3.11.4,kivy==2.2.1,kivymd==1.1.1,pyjnius,pillow,requests,plyer
+requirements = python3==3.11.4,hostpython3==3.11.4,kivy==2.2.1,pyjnius,pillow,requests,plyer
 
 # =====================================================
 # LOG
@@ -42,11 +42,9 @@ android.archs = arm64-v8a, armeabi-v7a
 android.add_libs_arm64_v8a = nodejs_backend/bin/arm64-v8a/libnode.so
 android.add_libs_armeabi_v7a = nodejs_backend/bin/armeabi-v7a/libnode.so
 
-# =====================================================
-# P4A 
-# =====================================================
+# p4a.source_dir: thêm lại
 p4a.bootstrap = sdl2
-# ĐÃ SỬA: Xóa p4a.source_dir = ./p4a_patched để tránh xung đột môi trường build
+p4a.source_dir = ./p4a_patched
 
 # =====================================================
 # ANDROIDX
