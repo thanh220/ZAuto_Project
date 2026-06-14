@@ -15,7 +15,24 @@ jobs:
 
     steps:
       - name: Checkout Source
-        uses: actions/checkout@v4      
+        uses: actions/checkout@v4 
+      - name: Bundle KivyMD 1.1.1 source into project
+        run: |
+          git clone --depth 1 --branch 1.1.1 https://github.com/kivymd/KivyMD.git _kivymd_tmp
+          cp -r _kivymd_tmp/kivymd ./kivymd
+          rm -rf _kivymd_tmp
+          echo "✅ KivyMD bundled: $(ls kivymd/ | head -3)"
+
+      - name: Clone P4A và patch pip venv bug
+        run: |
+          git clone --depth 1 --branch v2024.01.21 \
+            https://github.com/kivy/python-for-android.git p4a_patched
+
+          BUILD_PY="p4a_patched/pythonforandroid/build.py"
+          sed -i "s/pip install -U pip/pip install 'pip==24.0'/g" "$BUILD_PY"
+
+          echo "--- Patch result ---"
+          grep -n "pip install" "$BUILD_PY"   
       - name: Cache Buildozer
         uses: actions/cache@v4
         with:
@@ -114,7 +131,7 @@ jobs:
       - name: Build APK (Release)
         run: |
           mkdir -p ~/.android && touch ~/.android/repositories.cfg
-
+          export P4A_SOURCE_DIR=$(pwd)/p4a_patched
           export P4A_RELEASE_KEYSTORE=$(pwd)/zauto.keystore
           export P4A_RELEASE_KEYSTORE_PASSWD=zauto123
           export P4A_RELEASE_KEYALIAS_PASSWD=zauto123
