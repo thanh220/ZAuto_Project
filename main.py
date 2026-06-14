@@ -2385,59 +2385,79 @@ class ZAutoProApp(MDApp):
             except Exception as e:
                 logger.error(f"Lỗi dọn dẹp on_stop: {e}")
     def start_node_server(self):
-        """Khởi động Node.js backend server.js (Hỗ trợ cả PC Windows và Android)"""
-        import subprocess
-        try:
-            base = os.path.dirname(os.path.abspath(__file__))
-            if platform == 'android':
-                from jnius import autoclass
-                Build = autoclass('android.os.Build')
-                # FIX: Cast Java String[] đúng cách, ưu tiên arm64-v8a
-                try:
-                    abis = [str(Build.SUPPORTED_ABIS[i]) for i in range(Build.SUPPORTED_ABIS.length)]
-                except Exception:
-                    abis = ['arm64-v8a']
-                abi = 'arm64-v8a' if 'arm64-v8a' in abis else abis[0]
-                node_bin = os.path.join(base, 'nodejs_backend', 'bin', abi, 'libnode.so')
-            else:
-                node_bin = 'node'  # Chạy trên PC bằng Node cài sẵn
+            """Khởi động Node.js backend server.js (Hỗ trợ cả PC Windows và Android)"""
+            import subprocess
+            import shutil
+            import os
+            import threading
+            
+            try:
+                base = os.path.dirname(os.path.abspath(__file__))
+                server_script = os.path.join(base, 'nodejs_backend', 'server.js')
+                node_cwd = os.path.join(base, 'nodejs_backend')
 
-            server_script = os.path.join(base, 'nodejs_backend', 'server.js')
-            node_cwd = os.path.join(base, 'nodejs_backend')
+                if platform == 'android':
+                    from jnius import autoclass
+                    Build = autoclass('android.os.Build')
+                    
+                    # Xác định ABI ưu tiên
+                    try:
+                        abis = [str(Build.SUPPORTED_ABIS[i]) for i in range(Build.SUPPORTED_ABIS.length)]
+                    except Exception:
+                        abis = ['arm64-v8a']
+                    abi = 'arm64-v8a' if 'arm64-v8a' in abis else abis[0]
+                    
+                    # Đường dẫn file libnode.so gốc (read-only)
+                    src_node_bin = os.path.join(base, 'nodejs_backend', 'bin', abi, 'libnode.so')
+                    
+                    # Tạo thư mục writable nằm ngoài thư mục 'app' (lùi ra 1 cấp)
+                    # Ví dụ: base là /data/data/.../files/app -> files_dir là /data/data/.../files
+                    files_dir = os.path.dirname(base) 
+                    writable_dir = os.path.join(files_dir, 'node_bin')
+                    os.makedirs(writable_dir, exist_ok=True)
+                    
+                    # File thực thi đích
+                    node_bin = os.path.join(writable_dir, 'node')
+                    
+                    if not os.path.exists(src_node_bin):
+                        logger.error(f'Không tìm thấy node binary gốc tại: {src_node_bin}')
+                        return
+                    
+                    # Chỉ copy và chmod nếu file đích chưa tồn tại 
+                    # (hoặc bạn có thể thêm logic so sánh kích thước file để update phiên bản mới)
+                    if not os.path.exists(node_bin):
+                        shutil.copy2(src_node_bin, node_bin)
+                        os.chmod(node_bin, 0o755)  # Cấp quyền thực thi trên thư mục writable
+                        logger.info(f'Đã copy và chmod node binary sang: {node_bin}')
+                else:
+                    node_bin = 'node'  # Chạy trên PC bằng Node cài sẵn
 
-            if platform == 'android':
-                if not os.path.exists(node_bin):
-                    logger.error(f'Không tìm thấy node binary tại: {node_bin}')
-                    return
-                try: os.chmod(node_bin, 0o755)
-                except: pass
+                env = os.environ.copy()
+                env['NODE_PATH'] = os.path.join(node_cwd, 'node_modules')
+                is_windows = os.name == 'nt' and platform != 'android'
 
-            env = os.environ.copy()
-            env['NODE_PATH'] = os.path.join(node_cwd, 'node_modules')
-            is_windows = os.name == 'nt' and platform != 'android'
+                proc = subprocess.Popen(
+                    [node_bin, server_script],
+                    cwd=node_cwd, env=env,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    shell=True if is_windows else False
+                )
+                logger.info(f'Node.js server đã khởi động ngầm thành công, PID={proc.pid}')
 
-            proc = subprocess.Popen(
-                [node_bin, server_script],
-                cwd=node_cwd, env=env,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                shell=True if is_windows else False
-            )
-            logger.info(f'Node.js server đã khởi động ngầm thành công, PID={proc.pid}')
+                # Đọc luồng dữ liệu log tránh đầy bộ đệm treo tiến trình
+                def log_stream(stream, prefix):
+                    try:
+                        for line in iter(stream.readline, b''):
+                            msg = line.decode('utf-8', errors='ignore').strip()
+                            if msg: logger.info(f'[{prefix}] {msg}')
+                    except: pass
+                    finally: stream.close()
 
-            # Đọc luồng dữ liệu log tránh đầy bộ đệm treo tiến trình
-            def log_stream(stream, prefix):
-                try:
-                    for line in iter(stream.readline, b''):
-                        msg = line.decode('utf-8', errors='ignore').strip()
-                        if msg: logger.info(f'[{prefix}] {msg}')
-                except: pass
-                finally: stream.close()
+                threading.Thread(target=log_stream, args=(proc.stdout, 'Node-Out'), daemon=True).start()
+                threading.Thread(target=log_stream, args=(proc.stderr, 'Node-Err'), daemon=True).start()
 
-            threading.Thread(target=log_stream, args=(proc.stdout, 'Node-Out'), daemon=True).start()
-            threading.Thread(target=log_stream, args=(proc.stderr, 'Node-Err'), daemon=True).start()
-
-        except Exception as e:
-            logger.error(f'Lỗi nghiêm trọng khi khởi động Node server: {e}')
+            except Exception as e:
+                logger.error(f'Lỗi nghiêm trọng khi khởi động Node server: {e}')
     
     def check_for_update(self):
         """Hàm tự động gửi yêu cầu kiểm tra phiên bản từ server Gist"""
