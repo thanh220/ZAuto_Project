@@ -273,6 +273,8 @@ async function startZalo() {
 
 app.get('/api/events', (req, res) => { res.json({ events: eventQueue }); eventQueue = []; });
 
+app.get('/health', (req, res) => { res.sendStatus(200); });
+
 app.post('/api/cookie_login', async (req, res) => {
     try {
         const { raw_cookie, imei, user_agent } = req.body;
