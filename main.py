@@ -2316,6 +2316,17 @@ class ZAutoProApp(MDApp):
                 activity = PythonActivity.mActivity
                 autoclass('org.zauto.ZaloWebManager').initWebView(activity)
                 self.webview_inited = True
+                # Inject thủ công lần đầu sau 8 giây - bù cho onPageFinished chạy trước
+                # (Dự phòng: nếu Zalo đã đăng nhập sẵn, onPageFinished chạy sớm hơn lúc JS được thêm vào)
+                def _force_inject(dt):
+                    try:
+                        ZWM = autoclass('org.zauto.ZaloWebManager')
+                        if ZWM.hiddenWebView is not None:
+                            ZWM.injectSidebarObserver(ZWM.hiddenWebView)
+                            logger.info("Force inject sidebar observer thành công")
+                    except Exception as e:
+                        logger.error(f"Force inject lỗi: {e}")
+                Clock.schedule_once(_force_inject, 8.0)
             except Exception:
                 print(traceback.format_exc())
 
