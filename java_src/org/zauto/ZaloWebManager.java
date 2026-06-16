@@ -1080,21 +1080,23 @@ public class ZaloWebManager {
                     }
 
                     @Override
-                    public void onPageFinished(WebView view, String url) {
-                        super.onPageFinished(view, url);
-                        CookieManager.getInstance().flush();
-                        
-                        // ĐÃ TẮT: Không tiêm JS cào tin nhắn của Java nữa vì Node.js đã lo việc này
-                        /*
-                        view.postDelayed(() -> {
-                            try {
-                                if (hiddenWebView != null) injectSidebarObserver(hiddenWebView);
-                            } catch (Exception e) {
-                                Log.e(TAG, "Inject Error", e);
-                            }
-                        }, 5000);
-                        */
-                    }
+					public void onPageFinished(WebView view, String url) {
+						super.onPageFinished(view, url);
+						CookieManager.getInstance().flush();
+
+						// KÍCH HOẠT LẠI: Tiêm JS observer sau khi trang load xong
+						// Đây là HỆ THỐNG THẦN KINH của app — không được tắt
+						view.postDelayed(() -> {
+							try {
+								if (hiddenWebView != null) {
+									Log.d(TAG, "onPageFinished: Injecting sidebar observer for url=" + url);
+									injectSidebarObserver(hiddenWebView);
+								}
+							} catch (Exception e) {
+								Log.e(TAG, "Inject Error", e);
+							}
+						}, 5000);
+					}
                     
                     @Override
                     public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
@@ -1155,7 +1157,7 @@ public class ZaloWebManager {
                 }
 
                 // ĐÃ TẮT WATCHDOG: Giúp WebView ngủ đông hoàn toàn khi ẩn, không gây nóng máy
-                // startWatchdog();
+                startWatchdog();
 
             } catch (Exception e) {
                 Log.e(TAG, "Init Error", e);
