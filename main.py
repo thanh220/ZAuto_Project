@@ -988,6 +988,8 @@ class ZAutoProApp(MDApp):
             self.audio_worker_thread.start()
             self.poll_worker_thread = threading.Thread(target=self._java_poll_worker, daemon=True)
             self.poll_worker_thread.start()
+            self.node_poll_worker_thread = threading.Thread(target=self._node_poll_worker, daemon=True)
+            self.node_poll_worker_thread.start()
 
             Clock.schedule_interval(self._system_watchdog, 180)
             Clock.schedule_interval(self._process_ui_queue, 0.1)
@@ -1493,7 +1495,7 @@ class ZAutoProApp(MDApp):
 
         # KIỂM TRA NODE.JS CÒN SỐNG KHÔNG — tự restart nếu chết
         try:
-            urllib.request.urlopen("http://127.0.0.1:3000/health", timeout=2)
+            urllib.request.urlopen("http://127.0.0.1:5000/health", timeout=2)
         except Exception:
             logger.warning("Node.js không phản hồi — đang restart...")
             threading.Thread(target=self.start_node_server, daemon=True).start()
@@ -1639,6 +1641,55 @@ class ZAutoProApp(MDApp):
                             except queue.Full: pass
             except Exception as e:
                 pass # Bỏ qua lỗi jnius khi khởi động
+    def _node_poll_worker(self):
+        """Worker đọc dữ liệu LOGIN_SUCCESS/GROUPS_DATA/WEB_NEW_MSG từ Node.js server.js (port 5000)"""
+        import urllib.request, json as _json
+        while getattr(self, 'app_running', True):
+            try:
+                req = urllib.request.urlopen("http://127.0.0.1:5000/api/events", timeout=3)
+                data = _json.loads(req.read().decode('utf-8'))
+                events = data.get('events', [])
+                for ev in events:
+                    action = ev.get('action', '')
+                    payload = ev.get('data', {})
+
+                    if action == 'LOGIN_SUCCESS':
+                        self.is_linked = True
+                        zalo_name = payload.get('name', '')
+                        zalo_avatar = payload.get('avatar', '')
+                        if zalo_name: self.config_data['zalo_name'] = zalo_name
+                        if zalo_avatar: self.config_data['zalo_avatar'] = zalo_avatar
+                        self.save_config_silent()
+                        Clock.schedule_once(lambda dt: self.update_profile_ui(), 0)
+                        if not getattr(self, '_login_toasted', False):
+                            self._login_toasted = True
+                            self.safe_toast("Đã liên kết Zalo (Node.js) thành công!")
+
+                    elif action == 'GROUPS_DATA':
+                        groups = payload.get('groups', [])
+                        group_names = [g.get('name', '') for g in groups if g.get('name')]
+                        if group_names:
+                            Clock.schedule_once(lambda dt, g=group_names: self.update_group_list_ui(g), 0)
+
+                    elif action in ('WEB_NEW_MSG', 'WEB_NEW_VOICE', 'WEB_NEW_PHOTO'):
+                        group = payload.get('group_name', '')
+                        msg = payload.get('text', '') or payload.get('voice_url', '') or payload.get('photo_url', '')
+                        msg_id = payload.get('msg_id', '')
+                        conv_id = payload.get('group_id', '')
+                        if group and msg:
+                            ev_payload = {'group': group, 'msg': msg, 'msg_id': msg_id, 'conversation_id': conv_id}
+                            try:
+                                self.msg_queue.put(('WEB_NEW_MSG', ev_payload), timeout=0.3)
+                            except queue.Full: pass
+
+                    elif action == 'LOGIN_ERROR':
+                        logger.error(f"Node LOGIN_ERROR: {payload.get('error','')}")
+
+            except Exception as e:
+                pass  # Bỏ qua lỗi khi Node chưa kịp khởi động hoặc mạng tạm gián đoạn
+
+            time.sleep(1.5)
+
     def _java_poll_worker(self):
         """Worker cào dữ liệu từ Java ngầm 24/24 và kiêm luôn Báo thức Zalo"""
         tick_count = 0
