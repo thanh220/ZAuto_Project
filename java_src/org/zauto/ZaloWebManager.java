@@ -130,8 +130,9 @@ public class ZaloWebManager {
             final String msgId,
             final String text,
             final String msgTextToFind,
-            final String sentTime) {
-
+            final String sentTime,
+			final String groupName) {
+        
         Activity safeActivity = activityRef != null ? activityRef.get() : activity;
         if (safeActivity == null || hiddenWebView == null) return;
 
@@ -142,6 +143,7 @@ public class ZaloWebManager {
                 String safeMsgId      = escapeJs(msgId != null ? msgId : "");
                 String safeTime       = escapeJs(sentTime != null ? sentTime : "");
                 String safeConvId     = escapeJs(conversationId != null ? conversationId : "");
+				String safeGroupName  = escapeJs(groupName != null ? groupName : "");  // ← THÊM DÒNG NÀY
 
                 String jsCode =
                 "(function() { try {" +
@@ -150,11 +152,11 @@ public class ZaloWebManager {
                 // BIẾN TOÀN CỤC TRONG CLOSURE
                 // ─────────────────────────────────────────────────────────────
                 "var _convId      = '" + safeConvId + "';" +
-                "var _reply       = '" + safeReply  + "';" +
-                "var _search      = '" + safeSearch + "';" +
-                "var _targetId    = '" + safeMsgId  + "';" +
-                "var _sentTime    = '" + safeTime   + "';" +
-
+				"var _reply       = '" + safeReply  + "';" +
+				"var _search      = '" + safeSearch + "';" +
+				"var _targetId    = '" + safeMsgId  + "';" +
+				"var _sentTime    = '" + safeTime   + "';" +
+				"var _groupName   = '" + safeGroupName + "';" + // ← BỔ SUNG DÒNG NÀY ĐỂ TRÁNH LỖI RUNTIME JS
                 // ─────────────────────────────────────────────────────────────
                 // BƯỚC 0: KHÁM PHÁ WEBPACK API (GIỮ NGUYÊN TỪ BẢN CŨ)
                 // ─────────────────────────────────────────────────────────────
@@ -266,23 +268,32 @@ public class ZaloWebManager {
                 // ─────────────────────────────────────────────────────────────
                 // BƯỚC 1: MỞ ĐÚNG NHÓM (GIỮ NGUYÊN + TĂNG TIMEOUT 3500ms)
                 // ─────────────────────────────────────────────────────────────
-                "function _openGroup(cb) {" +
+                // CODE MỚI — _openGroup tìm theo cả tên nhóm
+				"function _openGroup(cb) {" +
 				"   if (!_convId || _convId==='') {" +
-				// Không có convId — kiểm tra xem đang mở đúng nhóm chưa bằng _search (tên nhóm)
-				"       if (_search && _search.length > 1) {" +
-				"           var nameEls = document.querySelectorAll('.conv-item-title__name,[class*=conv-name],[class*=group-name]');" +
+				// Thử mở bằng tên nhóm (_groupName) — chính xác hơn _search
+				"       var _tryName = _groupName || (_search && _search.length > 1 ? _search.substring(0,20) : '');" +
+				"       if (_tryName && _tryName.length > 1) {" +
+				"           var nameEls = document.querySelectorAll('.conv-item-title__name,[class*=conv-name],[class*=group-name],[class*=ConvItemTitle]');" +
 				"           for (var ni=0; ni<nameEls.length; ni++) {" +
-				"               if ((nameEls[ni].textContent||'').trim().includes(_search.substring(0,15))) {" +
-				"                   var convItem2 = nameEls[ni].closest('.msg-item,.conv-item');" +
-				"                   if (convItem2) { convItem2.click(); setTimeout(function(){cb(true);},2000); return; }" +
+				"               var elTxt = (nameEls[ni].textContent||'').trim();" +
+				"               if (elTxt === _tryName || elTxt.includes(_tryName.substring(0,15))) {" +
+				"                   var convItem2 = nameEls[ni].closest('.msg-item,.conv-item,[anim-data-id]');" +
+				"                   if (convItem2) {" +
+				"                       convItem2.click();" +
+				// Cập nhật _convId từ DOM để các bước sau dùng được
+				"                       var foundId = convItem2.getAttribute('anim-data-id') || convItem2.getAttribute('data-id') || '';" +
+				"                       if (foundId) _convId = foundId;" +
+				"                       setTimeout(function(){cb(true);},2500); return;" +
+				"                   }" +
 				"               }" +
 				"           }" +
 				"       }" +
 				"       cb(true); return;" +
 				"   }" +
-                "   var item = document.querySelector('.msg-item[anim-data-id='+_convId+'] .conv-item')" +
-                "           || document.querySelector('.msg-item[anim-data-id='+_convId+']')" +
-                "           || document.querySelector('[id*='+_convId+']');" +
+                "   var item = document.querySelector('.msg-item[anim-data-id=\"' + _convId + '\"] .conv-item')" +
+				"           || document.querySelector('.msg-item[anim-data-id=\"' + _convId + '\"]')" +
+				"           || document.querySelector('[id*=\"' + _convId + '\"]');" +
                 "   if (!item) {" +
                 "       var all = document.querySelectorAll('.msg-item,.conv-item');" +
                 "       for (var i=0;i<all.length;i++) {" +
@@ -1298,6 +1309,7 @@ public class ZaloWebManager {
 			"               convId = msgItemEl.getAttribute('anim-data-id') || msgItemEl.id || '';" +
 			"               let id1 = msgItemEl.getAttribute('data-msg-id') || (msgItemEl.dataset ? msgItemEl.dataset.msgId : '');" +
 			"               if (id1 && id1.length > 5) realMsgId = id1;" +
+			// --- FALLBACK 1: data-qid ---
 			"               if (!realMsgId) {" +
 			"                   let qidEl = msgItemEl.querySelector('[data-qid]') || msgItemEl.closest('[data-qid]');" +
 			"                   let qid = qidEl ? qidEl.getAttribute('data-qid') : null;" +
@@ -1308,6 +1320,39 @@ public class ZaloWebManager {
 			"                           if (!convId) { let sp = qparts[0].split('@'); if(sp[1]) convId = sp[1]; }" +
 			"                       }" +
 			"                   }" +
+			"               }" +
+			// --- FALLBACK 2: data-id, data-conv-id, data-session-id trên chính node hoặc con ---
+			"               if (!convId) {" +
+			"                   let dataId = msgItemEl.getAttribute('data-id') || msgItemEl.getAttribute('data-conv-id') || msgItemEl.getAttribute('data-session-id');" +
+			"                   if (dataId && dataId.length > 3) convId = dataId;" +
+			"               }" +
+			"               if (!convId) {" +
+			"                   let childWithId = msgItemEl.querySelector('[data-id],[data-conv-id],[data-session-id]');" +
+			"                   if (childWithId) {" +
+			"                       convId = childWithId.getAttribute('data-id') || childWithId.getAttribute('data-conv-id') || childWithId.getAttribute('data-session-id') || '';" +
+			"                   }" +
+			"               }" +
+			// --- FALLBACK 3: quét React fiber sâu hơn (tầng 12 thay vì 8) ---
+			"               if (!convId) {" +
+			"                   try {" +
+			"                       let fbKeys = Object.keys(msgItemEl).filter(k => k.startsWith('__reactFiber') || k.startsWith('__reactProps'));" +
+			"                       for (let fk of fbKeys) {" +
+			"                           let fb = msgItemEl[fk]; let dep = 0;" +
+			"                           while (fb && dep < 12) {" +
+			"                               let p = fb.memoizedProps || fb.pendingProps;" +
+			"                               if (p) {" +
+			"                                   let cid = (p.session && p.session.id) ? String(p.session.id)" +
+			"                                           : p.convId ? String(p.convId)" +
+			"                                           : p.conversationId ? String(p.conversationId)" +
+			"                                           : p.threadId ? String(p.threadId)" +
+			"                                           : (p.data && p.data.threadId) ? String(p.data.threadId) : '';" +
+			"                                   if (cid && cid.length > 3) { convId = cid; break; }" +
+			"                               }" +
+			"                               fb = fb.return; dep++;" +
+			"                           }" +
+			"                           if (convId) break;" +
+			"                       }" +
+			"                   } catch(e) {}" +
 			"               }" +
             
             "               let keys = Object.keys(msgItemEl);" +
@@ -1439,27 +1484,33 @@ public class ZaloWebManager {
             "       } catch(e) {}" +
             "   }" +
 
-            // OBSERVE CONTAINER SIDEBAR
-            "   function startSidebarObserver() {" +
-            "       let container = document.getElementById('conversationListId');" +
-            "       if(!container) {" +
-            "           setTimeout(startSidebarObserver, 1500);" +
-            "           return;" +
-            "       }" +
-            "       if(window.zauto_sidebar_observer) window.zauto_sidebar_observer.disconnect();" +
-            "       window.zauto_sidebar_observer = new MutationObserver(mutations => {" +
+            // CODE MỚI — startSidebarObserver mạnh hơn, chịu được Zalo đổi UI
+			"   function _getConvContainer() {" +
+			"       return document.getElementById('conversationListId')" +
+			"           || document.querySelector('[class*=conversation-list],[class*=ConversationList],[class*=sidebar-list],[class*=chat-list]')" +
+			"           || document.querySelector('.app__body > div > div');" +
+			"   }" +
+			"   function startSidebarObserver() {" +
+			"       let container = _getConvContainer();" +
+			"       if(!container) {" +
+			"           setTimeout(startSidebarObserver, 1500);" +
+			"           return;" +
+			"       }" +
+			"       if(window.zauto_sidebar_observer) window.zauto_sidebar_observer.disconnect();" +
+			"       window.zauto_sidebar_observer = new MutationObserver(mutations => {" +
 			"           mutations.forEach(m => {" +
 			"               try {" +
 			"                   let targetNode = m.target.nodeType === 3 ? m.target.parentNode : m.target;" +
-			"                   let msgItem = targetNode.closest('.msg-item');" +
+			"                   let msgItem = targetNode.closest('.msg-item,[class*=conv-item],[class*=ConvItem]');" +
 			"                   if(msgItem) scanConvItem(msgItem);" +
 			"                   if (m.addedNodes && m.addedNodes.length > 0) {" +
 			"                       m.addedNodes.forEach(nd2 => {" +
 			"                           if (nd2.nodeType !== 1) return;" +
 			"                           var isMsg = (nd2.id && (nd2.id.startsWith('msg')||nd2.id.startsWith('message-frame_'))) || nd2.hasAttribute('data-qid') ||" +
-			"                                       nd2.classList.contains('msg-item') || nd2.querySelector('[data-qid],[id^=\"message-frame_\"],[id^=msg_],[id^=msg-]');" +
+			"                                       nd2.classList.contains('msg-item') || nd2.hasAttribute('anim-data-id') ||" +
+			"                                       nd2.querySelector('[data-qid],[id^=\"message-frame_\"],[id^=msg_],[id^=msg-],[anim-data-id]');" +
 			"                           if (isMsg) {" +
-			"                               let mi2 = nd2.closest('.msg-item') || nd2;" +
+			"                               let mi2 = nd2.closest('.msg-item,[class*=conv-item]') || nd2;" +
 			"                               if (mi2) scanConvItem(mi2);" +
 			"                           }" +
 			"                       });" +
@@ -1467,11 +1518,11 @@ public class ZaloWebManager {
 			"               } catch(e) {}" +
 			"           });" +
 			"       });" +
-            "       window.zauto_sidebar_observer.observe(container, { childList: true, subtree: true, characterData: true });" +
-            "       document.querySelectorAll('.msg-item').forEach(scanConvItem);" +
-            "       collectGroups();" +
-            "       ZAutoBridge.onLoginSuccess('Đã kết nối', '');" +
-            "   }" +
+			"       window.zauto_sidebar_observer.observe(container, { childList: true, subtree: true, characterData: true });" +
+			"       document.querySelectorAll('.msg-item,[anim-data-id]').forEach(scanConvItem);" +
+			"       collectGroups();" +
+			"       ZAutoBridge.onLoginSuccess('Đã kết nối', '');" +
+			"   }" +
 
             // WATCHDOG + NÚT ĐỒNG BỘ
             "   function systemWatchdog() {" +
@@ -1735,6 +1786,13 @@ public class ZaloWebManager {
             "       out.zMessengerFound = !!(window.zMessenger && typeof window.zMessenger.sendMessage === 'function');" +
             "       out.hasConversationList = !!document.getElementById('conversationListId');" +
             "       out.isLoginScreen = !!(document.querySelector('.qrcode') || document.querySelector('.login-container'));" +
+            
+            // --- BẮT ĐẦU FIX 6: QUÉT RỘNG TÌM TIN VÀ ĐẾM SỐ LƯỢNG ITEM ---
+            "       var msgCheck = document.querySelector('[id^=\"message-frame_\"],[data-qid],[id^=msg_],[id^=msg-],.chat-bubble,.chat-item');" +
+            "       out.lastMsgNode = msgCheck ? 'found' : 'none';" +
+            "       out.msgItemCount = document.querySelectorAll('.msg-item,[anim-data-id]').length;" +
+            // --- KẾT THÚC FIX 6 ---
+
             "       var lasts = document.querySelectorAll('[data-qid],[id^=\"message-frame_\"],[id^=msg_],[id^=msg-],.chat-bubble,.chat-item');" +
             "       if (lasts.length > 0) {" +
             "           var lastNode = lasts[lasts.length - 1];" +
