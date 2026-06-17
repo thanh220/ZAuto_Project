@@ -1587,11 +1587,25 @@ class ZAutoProApp(MDApp):
         if not getattr(self, 'app_running', False): return
 
         # KIỂM TRA NODE.JS CÒN SỐNG KHÔNG — tự restart nếu chết
+        # CODE MỚI — giới hạn số lần restart, không spam
+        _node_fail_count = getattr(self, '_node_fail_count', 0)
         try:
             urllib.request.urlopen("http://127.0.0.1:5000/health", timeout=2)
+            self._node_fail_count = 0  # reset khi OK
         except Exception:
-            logger.warning("Node.js không phản hồi — đang restart...")
-            threading.Thread(target=self.start_node_server, daemon=True).start()
+            self._node_fail_count = _node_fail_count + 1
+            # Chỉ restart sau 3 lần fail liên tiếp (tránh spam)
+            if self._node_fail_count >= 3:
+                logger.warning(f"Node.js không phản hồi ({self._node_fail_count} lần) — đang restart...")
+                self._node_fail_count = 0
+                if not getattr(self, '_node_restarting', False):
+                    self._node_restarting = True
+                    def _do_restart():
+                        try:
+                            self.start_node_server()
+                        finally:
+                            self._node_restarting = False
+                    threading.Thread(target=_do_restart, daemon=True).start()
 
         with self.worker_restart_lock:
             if not hasattr(self, 'msg_worker_thread') or not self.msg_worker_thread.is_alive():
@@ -1982,13 +1996,15 @@ class ZAutoProApp(MDApp):
                 except Exception as ek:
                     logger.warning(f"hideKeyboard lỗi: {ek}")
 
+                # CODE MỚI — truyền thêm group_name để _openGroup tìm đúng nhóm
                 _ZWM.sendReplyToSpecificMessage(
                     _act,
                     payload.get('conversation_id', ''),
                     payload.get('msg_id', ''),
                     payload.get('reply_text', ''),
                     payload.get('msg_content', ''),
-                    time.strftime('%H:%M')
+                    time.strftime('%H:%M'),
+                    payload.get('group_name', payload.get('group', ''))   # ← THÊM DÒNG NÀY
                 )
                 logger.info(f"[CHOT] Đã gửi lệnh cho nhóm: {payload.get('group', '')}")
 
