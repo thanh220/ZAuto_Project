@@ -1395,16 +1395,14 @@ class ZAutoProApp(MDApp):
                         return # Tin text trùng -> Bỏ qua
         # Voice: chặn trùng lặp cả 2 trường hợp — có ID thật và không có ID thật
         else:
-            # Voice KHÔNG có ID thật:
-            # Dùng msg_id + duration + timestamp để phân biệt từng tin riêng biệt
-            # KHÔNG dùng msg_hash vì mọi "[Tin nhắn thoại]%%%30" đều ra cùng hash
-            voice_duration = msg.split("%%%")[1] if "%%%" in msg else "-1"
-            voice_ts_key   = f"VOICE_FB_{conversation_id}_{voice_duration}_{int(time.time() // 5)}"
-            # Cửa sổ 5 giây: cùng nhóm + cùng độ dài + cùng giây → mới là trùng
-            if voice_ts_key in self.processed_msg_hashes:
+            # msg_id giờ đã có SEQ riêng cho từng node DOM (set từ Java),
+            # nên dùng trực tiếp msg_id làm khóa chống trùng — KHÔNG dùng cửa sổ
+            # thời gian 5s nữa (cách cũ làm 2 tin thoại liên tiếp cùng duration
+            # trong vòng 5s bị coi là 1 tin và bị chặn im lặng).
+            voice_key = f"VOICE_FB_{conversation_id}_{msg_id}"
+            if voice_key in self.processed_msg_hashes:
                 return
-            self.processed_msg_hashes[voice_ts_key] = time.time()
-            # Dọn key cũ quá 120s tránh RAM leak
+            self.processed_msg_hashes[voice_key] = time.time()
             now_ts = time.time()
             stale = [k for k, v in list(self.processed_msg_hashes.items())
                      if k.startswith("VOICE_FB_") and now_ts - v > 120]
@@ -1871,40 +1869,26 @@ class ZAutoProApp(MDApp):
 
     def _execute_reply_safe(self, payload):
         """
-        CHỐT CUỐC AN TOÀN:
-        - switch_tab qua Clock (UI thread) → sau đó gửi qua background (không nested thread)
-        - jnius chỉ được gọi từ đúng 1 background thread, không bao giờ từ UI thread trực tiếp
+        CHỐT CUỐC ÂM THẦM (KHÔNG NHẢY TAB):
+        - KHÔNG switch_tab nữa — WebView Java tự đưa mình vào vị trí ẩn (0,0 alpha=0.01)
+          để chạy JS click/quote, không cần Tab Zalo hiện diện trên UI.
+        - jnius chỉ được gọi từ đúng 1 background thread, không bao giờ từ UI thread trực tiếp.
         """
         if platform != 'android' or not getattr(self, 'is_linked', False):
             return
- 
-        # Bước 1: Switch sang tab Zalo trên UI Thread qua Clock (an toàn)
-        def _switch_tab(dt):
-            try:
-                self.root.ids.bottom_nav.switch_tab('tab_zalo')
-            except Exception as e_tab:
-                logger.warning(f"switch_tab lỗi: {e_tab}")
- 
-        Clock.schedule_once(_switch_tab, 0)
- 
-        # Bước 2: Chạy toàn bộ Java call trong 1 background thread độc lập (KHÔNG spawn từ UI thread)
+
         def _bg_send():
             try:
-                # Chờ tab switch + WebView render xong
-                time.sleep(0.35)
- 
                 from jnius import autoclass as _ac
                 _PA = _ac('org.kivy.android.PythonActivity')
                 _ZWM = _ac('org.zauto.ZaloWebManager')
                 _act = _PA.mActivity
- 
-                # Ẩn bàn phím
+
                 try:
                     _ZWM.hideKeyboard(_act)
                 except Exception as ek:
                     logger.warning(f"hideKeyboard lỗi: {ek}")
- 
-                # Gửi reply đè tin cũ
+
                 _ZWM.sendReplyToSpecificMessage(
                     _act,
                     payload.get('conversation_id', ''),
@@ -1914,10 +1898,10 @@ class ZAutoProApp(MDApp):
                     time.strftime('%H:%M')
                 )
                 logger.info(f"[CHOT] Đã gửi lệnh cho nhóm: {payload.get('group', '')}")
- 
+
             except Exception as e_bg:
                 logger.error(f"Lỗi _bg_send: {traceback.format_exc()}")
- 
+
         import threading
         threading.Thread(target=_bg_send, daemon=True).start()
  
