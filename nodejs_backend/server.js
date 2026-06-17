@@ -184,7 +184,40 @@ function startListener() {
         if (msgType === 'chat.voice' && typeof content === 'object' && content !== null) {
             const voiceUrl = content.href || content.fileUrl || '';
             if (voiceUrl) {
-                eventQueue.push({ action: 'WEB_NEW_VOICE', data: { msg_type: 'voice', group_id: msg.threadId, group_name: realGroupName, sender_id: msg.data.uidFrom, sender_name: msg.data.dName || '', voice_url: voiceUrl, msg_id: msg.data.msgId, is_group: isGroup, raw_data: { content: msg.data.content, msgType: msg.data.msgType, msgId: msg.data.msgId, cliMsgId: msg.data.cliMsgId, ts: msg.data.ts, ttl: msg.data.ttl, uidFrom: msg.data.uidFrom, propertyExt: msg.data.propertyExt } }});
+                // Lấy duration từ propertyExt nếu có
+                let duration = -1;
+                try {
+                    const propExt = msg.data.propertyExt;
+                    if (propExt && typeof propExt === 'object' && propExt.duration != null) {
+                        duration = Number(propExt.duration);
+                    }
+                } catch(e) {}
+ 
+                eventQueue.push({
+                    action: 'WEB_NEW_VOICE',
+                    data: {
+                        msg_type:    'voice',
+                        group_id:    msg.threadId,
+                        group_name:  realGroupName,
+                        sender_id:   String(msg.data.uidFrom  || ''),
+                        sender_name: String(msg.data.dName    || ''),
+                        voice_url:   voiceUrl,
+                        duration:    duration,
+                        msg_id:      String(msg.data.msgId    || ''),
+                        is_group:    isGroup,
+                        // raw_data đủ để quote (gửi đè tin thoại)
+                        raw_data: {
+                            content:     msg.data.content,
+                            msgType:     msg.data.msgType,
+                            msgId:       String(msg.data.msgId    || ''),
+                            cliMsgId:    String(msg.data.cliMsgId || ''),
+                            ts:          Number(msg.data.ts       || Date.now()),
+                            ttl:         Number(msg.data.ttl      || 0),
+                            uidFrom:     String(msg.data.uidFrom  || ''),
+                            propertyExt: msg.data.propertyExt || {}
+                        }
+                    }
+                });
             }
         }
         if (msgType === 'chat.photo' && typeof content === 'object' && content !== null) {
@@ -328,23 +361,55 @@ app.post('/api/cookie_login', async (req, res) => {
 app.post('/api/reply', async (req, res) => {
     if (!api) return res.status(400).json({ error: 'Chưa kết nối Zalo' });
     try {
-        const { message, group_id, quote_raw_data, is_group } = req.body;
+        const { message, group_id, quote_raw_data, is_group, msg_id, msg_content } = req.body;
         let messageContent;
-        if (quote_raw_data) {
+ 
+        if (quote_raw_data && quote_raw_data.msgId) {
+            // ─── Có đủ raw_data (từ listener): gửi quote chuẩn Zalo ─────
+            let quoteContent = quote_raw_data.content;
+            // Tin thoại: content là object {href, fileUrl, ...}
+            if (typeof quoteContent === 'object' && quoteContent !== null) {
+                quoteContent = JSON.stringify(quoteContent);
+            }
             messageContent = {
                 msg: message,
                 quote: {
-                    content: typeof quote_raw_data.content === 'object' ? JSON.stringify(quote_raw_data.content) : quote_raw_data.content,
-                    msgType: quote_raw_data.msgType, propertyExt: quote_raw_data.propertyExt,
-                    uidFrom: quote_raw_data.uidFrom, msgId: quote_raw_data.msgId,
-                    cliMsgId: quote_raw_data.cliMsgId, ts: quote_raw_data.ts, ttl: quote_raw_data.ttl || 0
+                    content:     quoteContent || msg_content || '',
+                    msgType:     quote_raw_data.msgType  || 'webchat',
+                    propertyExt: quote_raw_data.propertyExt || '',
+                    uidFrom:     String(quote_raw_data.uidFrom || ''),
+                    msgId:       String(quote_raw_data.msgId   || msg_id || ''),
+                    cliMsgId:    String(quote_raw_data.cliMsgId || ''),
+                    ts:          Number(quote_raw_data.ts  || Date.now()),
+                    ttl:         Number(quote_raw_data.ttl || 0)
+                }
+            };
+        } else if (msg_id && msg_id.length > 4 &&
+                   !msg_id.startsWith('TIME_') && !msg_id.startsWith('VIRTUAL_') &&
+                   !msg_id.startsWith('CONTENT_') && !msg_id.startsWith('VOICE_')) {
+            // ─── Chỉ có msg_id (từ WebView JS): gửi quote tối giản ──────
+            // Đủ để Zalo Web hiển thị "trả lời tin nhắn" nhưng không có preview nội dung
+            messageContent = {
+                msg: message,
+                quote: {
+                    content:  msg_content || '',
+                    msgType:  'webchat',
+                    uidFrom:  '',
+                    msgId:    String(msg_id),
+                    cliMsgId: String(msg_id),
+                    ts:       Date.now(),
+                    ttl:      0
                 }
             };
         } else {
+            // ─── Không có gì để quote: gửi tin thường ────────────────────
             messageContent = { msg: message };
         }
+ 
+        console.log(`📨 Gửi tới ${group_id} (is_group=${is_group}):`, message.substring(0, 30));
         await api.sendMessage(messageContent, String(group_id), is_group ? 1 : 0);
         res.json({ status: 'success' });
+ 
     } catch (error) {
         console.error('❌ Lỗi gửi tin:', error);
         res.status(500).json({ error: String(error) });
