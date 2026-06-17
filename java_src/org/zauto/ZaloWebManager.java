@@ -1711,6 +1711,85 @@ public class ZaloWebManager {
             return "";
         }
     }
+	// =========================================================
+    // DEEP CHECK — TỰ CHẨN ĐOÁN TRẠNG THÁI WEBVIEW THẬT (KHÔNG BỊA)
+    // Trả về JSON string cho Python đọc: zMessenger có tồn tại không,
+    // sidebar có hiển thị không, tin cuối cùng tìm được không, kích
+    // thước bubble đo được thật để biết double-click có khả năng trúng không.
+    // Đồng bộ (synchronous) — Python phải gọi từ background thread, không phải UI thread,
+    // vì evaluateJavascript callback chạy trên UI thread nhưng ta cần kết quả ngay.
+    // =========================================================
+    public static String selfDiagnose(final Activity activity) {
+        Activity safeActivity = activityRef != null ? activityRef.get() : activity;
+        if (safeActivity == null || hiddenWebView == null) {
+            return "{\"error\":\"webview_null\"}";
+        }
+
+        final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+        final StringBuilder resultHolder = new StringBuilder("{}");
+
+        String js =
+            "(function() {" +
+            "   try {" +
+            "       var out = {};" +
+            "       out.zMessengerFound = !!(window.zMessenger && typeof window.zMessenger.sendMessage === 'function');" +
+            "       out.hasConversationList = !!document.getElementById('conversationListId');" +
+            "       out.isLoginScreen = !!(document.querySelector('.qrcode') || document.querySelector('.login-container'));" +
+            "       var lasts = document.querySelectorAll('[data-qid],[id^=\"message-frame_\"],[id^=msg_],[id^=msg-],.chat-bubble,.chat-item');" +
+            "       if (lasts.length > 0) {" +
+            "           var lastNode = lasts[lasts.length - 1];" +
+            "           out.lastMsgNodeFound = true;" +
+            "           var bubble = lastNode.querySelector('.card--text,.card-content,[class*=bubble],[class*=chat-item__content]') || lastNode;" +
+            "           var rect = bubble.getBoundingClientRect();" +
+            "           out.bubbleWidth = Math.round(rect.width);" +
+            "           out.bubbleHeight = Math.round(rect.height);" +
+            "       } else {" +
+            "           out.lastMsgNodeFound = false;" +
+            "           out.bubbleWidth = 0;" +
+            "           out.bubbleHeight = 0;" +
+            "       }" +
+            "       out.zautoStarted = !!window.zauto_started;" +
+            "       out.bootTimeMs = window.zauto_boot_time || 0;" +
+            "       return JSON.stringify(out);" +
+            "   } catch(e) { return JSON.stringify({error:String(e)}); }" +
+            "})();";
+
+        try {
+            safeActivity.runOnUiThread(() -> {
+                try {
+                    hiddenWebView.evaluateJavascript(js, value -> {
+                        try {
+                            String unescaped = value;
+                            // evaluateJavascript trả về chuỗi JSON đã được escape kép (vd: "\"{\\\"a\\\":1}\"")
+                            if (unescaped != null && unescaped.length() >= 2 && unescaped.startsWith("\"") && unescaped.endsWith("\"")) {
+                                unescaped = unescaped.substring(1, unescaped.length() - 1)
+                                        .replace("\\\"", "\"")
+                                        .replace("\\\\", "\\");
+                            }
+                            resultHolder.setLength(0);
+                            resultHolder.append(unescaped != null ? unescaped : "{}");
+                        } catch (Exception eParse) {
+                            resultHolder.setLength(0);
+                            resultHolder.append("{\"error\":\"parse_failed\"}");
+                        } finally {
+                            latch.countDown();
+                        }
+                    });
+                } catch (Exception eEval) {
+                    resultHolder.setLength(0);
+                    resultHolder.append("{\"error\":\"eval_failed\"}");
+                    latch.countDown();
+                }
+            });
+            // Chờ tối đa 4 giây để JS trả kết quả — tránh treo background thread của Python mãi
+            latch.await(4, java.util.concurrent.TimeUnit.SECONDS);
+        } catch (Exception e) {
+            return "{\"error\":\"" + e.getMessage() + "\"}";
+        }
+
+        return resultHolder.toString();
+    }
+
 	public static String getImei() {
         return currentImei;
     }
