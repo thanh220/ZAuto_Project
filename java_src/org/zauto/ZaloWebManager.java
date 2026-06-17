@@ -780,23 +780,23 @@ public class ZaloWebManager {
                 "           rect = bubble.getBoundingClientRect();" +
                 "       }" +
 
-				// Double-click đúng chuẩn Zalo: click vào VÙNG TRỐNG trong hàng tin nhắn (bên ngoài bubble text)
-				// Theo cấu trúc HTML: .message-frame là row toàn bộ, bubble là .text-message__container bên trong
-				"       var row = node.closest('.message-frame,.message-container,[class*=message-row],[class*=chat-item],[class*=MessageItem]') || node;" +
-				"       var rowRect = row.getBoundingClientRect();" +
-				"       var bubbleRect = bubble.getBoundingClientRect();" +
-				"       var cy = Math.max(10, Math.min(rowRect.top + rowRect.height/2, vh-10));" +
-				"       var cx;" +
-				// Kiểm tra vùng trống BÊN PHẢI bubble trong row
-				"       if (rowRect.right - bubbleRect.right > 30) {" +
-				"           cx = Math.min(bubbleRect.right + Math.floor((rowRect.right - bubbleRect.right)/2), vw-10);" +
-				// Kiểm tra vùng trống BÊN TRÁI bubble trong row
-				"       } else if (bubbleRect.left - rowRect.left > 30) {" +
-				"           cx = Math.max(10, rowRect.left + Math.floor((bubbleRect.left - rowRect.left)/2));" +
-				// Fallback: bubble chiếm gần hết row → click tâm bubble
-				"       } else {" +
-				"           cx = Math.max(10, Math.min(bubbleRect.left + bubbleRect.width/2, vw-10));" +
-				"       }" +
+				// Double-click ĐÚNG CHUẨN ZALO WEB: "Bấm đúp vào vùng CẠNH tin nhắn để trả lời"
+					// Cạnh = mép trong của chính bubble, KHÔNG phải vùng trống ngoài row.
+					// Bubble của ĐỐI PHƯƠNG lệch trái → bấm cạnh PHẢI bubble.
+					// Bubble CỦA MÌNH lệch phải → bấm cạnh TRÁI bubble.
+					"       var row = node.closest('.message-frame,.message-container,[class*=message-row],[class*=chat-item],[class*=MessageItem]') || node;" +
+					"       var rowRect = row.getBoundingClientRect();" +
+					"       var bubbleRect = bubble.getBoundingClientRect();" +
+					"       var cy = Math.max(10, Math.min(bubbleRect.top + bubbleRect.height/2, vh-10));" +
+					"       var cx;" +
+					"       var EDGE_MARGIN = 6;" +
+					"       var bubbleCenterX = bubbleRect.left + bubbleRect.width/2;" +
+					"       var rowCenterX = rowRect.left + rowRect.width/2;" +
+					"       if (bubbleCenterX < rowCenterX) {" +
+					"           cx = Math.max(10, Math.min(bubbleRect.right - EDGE_MARGIN, vw-10));" +
+					"       } else {" +
+					"           cx = Math.max(10, Math.min(bubbleRect.left + EDGE_MARGIN, vw-10));" +
+					"       }" +
 
                 "       var wrapper = node.closest('.chat-message,.message-container,[class*=message-row],[class*=chat-item],[class*=MessageItem]') || node;" +
                 "       var triggered = false;" +
@@ -1384,6 +1384,10 @@ public class ZaloWebManager {
 
             // =========================================================================
             // FIX LỖI LẶP TIN: Dùng stableId cố định, không phụ thuộc vào đồng hồ TIME_
+            // FIX VẤN ĐỀ 3: voice không có ID thật KHÔNG còn dùng timeString (chỉ có
+            // giờ:phút — 2 tin thoại liên tiếp trong cùng phút bị coi là trùng và bị
+            // chặn im lặng). Gắn SEQ tăng dần cố định cho từng msgItemEl (mỗi tin thoại
+            // mới luôn là 1 node DOM mới) để đảm bảo luôn unique.
             // =========================================================================
             "           let stableId;" +
             "           if (realMsgId && realMsgId.length > 3 && !realMsgId.startsWith('TIME_')) {" +
@@ -1391,8 +1395,15 @@ public class ZaloWebManager {
             "           } else {" +
             "               let contentForHash = msgText.replace(/%%%[-0-9]+$/, '').trim();" +
             "               if (isVoice) {" +
-            "                   let voiceTimeKey = (realMsgId && realMsgId.length > 3 && !realMsgId.startsWith('TIME_') && !realMsgId.startsWith('TS_')) ? realMsgId : ('V_' + convId + '_' + timeString + '_' + senderName);" +
-			"                   stableId = 'VOICE_' + voiceTimeKey;" +
+            "                   if (realMsgId && realMsgId.length > 3 && !realMsgId.startsWith('TIME_') && !realMsgId.startsWith('TS_')) {" +
+            "                       stableId = 'VOICE_' + realMsgId;" +
+            "                   } else {" +
+            "                       if (!msgItemEl.dataset.zautoVoiceSeq) {" +
+            "                           window.zauto_voice_counter = (window.zauto_voice_counter || 0) + 1;" +
+            "                           msgItemEl.dataset.zautoVoiceSeq = String(window.zauto_voice_counter);" +
+            "                       }" +
+            "                       stableId = 'VOICE_V_' + convId + '_' + timeString + '_' + senderName + '_SEQ' + msgItemEl.dataset.zautoVoiceSeq;" +
+            "                   }" +
             "               } else {" +
             "                   stableId = 'CONTENT_' + convId + '_' + contentForHash.substring(0, 60);" +
             "               }" +
