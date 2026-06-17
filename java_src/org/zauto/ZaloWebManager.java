@@ -291,7 +291,8 @@ public class ZaloWebManager {
 				"       }" +
 				"       cb(true); return;" +
 				"   }" +
-                "   var item = document.querySelector('.msg-item[anim-data-id=\"' + _convId + '\"] .conv-item')" +
+                // CODE FIX CHUẨN:
+				"   var item = document.querySelector('.msg-item[anim-data-id=\"' + _convId + '\"] .conv-item')" +
 				"           || document.querySelector('.msg-item[anim-data-id=\"' + _convId + '\"]')" +
 				"           || document.querySelector('[id*=\"' + _convId + '\"]');" +
                 "   if (!item) {" +
@@ -1215,7 +1216,7 @@ public class ZaloWebManager {
             // HÀM GỬI REPLY ĐA TẦNG (DÙNG SELECTOR CHUẨN + ENTER + BÁO CÁO TOAST)
             "   window.zautoSendReply = function(convId, fakeMsgId, text, groupName) {" +
             "       try {" +
-            "           let item = document.querySelector('.msg-item[anim-data-id=' + convId + '] .conv-item');" +
+            "           let item = document.querySelector('.msg-item[anim-data-id=\"' + convId + '\"] .conv-item');" +
             "           if(item) {" +
             "               let key = Object.keys(item).find(k => k.startsWith('__reactEventHandlers') || k.startsWith('__reactFiber'));" +
             "               if (key && item[key]) {" +
