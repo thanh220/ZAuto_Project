@@ -1295,17 +1295,20 @@ class ZAutoProApp(MDApp):
                     conv_id, msg_id, cache_key, duration = item
                     tts_text = ""
 
-                # Tạo khóa duy nhất chống phát lại (Chính xác đến từng giây)
+                 # Tạo khóa duy nhất chống phát lại
+                # Dùng monotonic counter để đảm bảo mỗi item trong queue luôn có key riêng
                 if not msg_id or len(msg_id) < 4 or msg_id.startswith("TIME_") or msg_id.startswith("VOICE_"):
-                    from datetime import datetime
-                    time_str = datetime.now().strftime("%d%m%Y_%H%M%S")
-                    audio_unique_key = f"VOICE_{conv_id}_{time_str}"
+                    # Không có ID thật: dùng monotonic time nano để tránh đụng key khi 2 tin < 1 giây
+                    audio_unique_key = f"VOICE_{conv_id}_{time.monotonic_ns()}"
+                    # Với key dạng này KHÔNG check audio_seen_dict (mỗi item đã unique)
+                    skip_seen_check = True
                 else:
                     audio_unique_key = f"{conv_id}_{msg_id}"
-
-                if audio_unique_key in self.audio_seen_dict:
+                    skip_seen_check = False
+ 
+                if not skip_seen_check and audio_unique_key in self.audio_seen_dict:
                     self.audio_queue.task_done()
-                    continue  # Đã phát rồi, bỏ qua
+                    continue  # Đã phát rồi (ID thật trùng), bỏ qua
 
                 # Đánh dấu ngay trước khi phát và ghi lại mốc thời gian
                 self.audio_seen_dict[audio_unique_key] = current_ts
@@ -1392,22 +1395,21 @@ class ZAutoProApp(MDApp):
                         return # Tin text trùng -> Bỏ qua
         # Voice: chặn trùng lặp cả 2 trường hợp — có ID thật và không có ID thật
         else:
-            if not msg_id.startswith("TIME_") and not msg_id.startswith("VIRTUAL_") and not msg_id.startswith("CONTENT_") and not msg_id.startswith("VOICE_"):
-                # Voice có ID thật → chặn 60s theo ID
-                voice_key = f"VOICE_REAL_{conversation_id}_{msg_id}"
-                if voice_key in self.processed_msg_hashes:
-                    if time.time() - self.processed_msg_hashes[voice_key] < 60.0:
-                        return
-                self.processed_msg_hashes[voice_key] = time.time()
-            else:
-                # Voice KHÔNG có ID thật → chặn 60s theo convId+hash nội dung
-                # Đây là nguyên nhân mỗi nhóm chỉ hiện 1 tin rồi im: JS stableId dùng timeString
-                # cố định nên zauto_seen đã chặn, nhưng nếu timeString thay đổi thì lọt qua
-                voice_fb_key = f"VOICE_FB_{conversation_id}_{msg_hash}"
-                if voice_fb_key in self.processed_msg_hashes:
-                    if time.time() - self.processed_msg_hashes[voice_fb_key] < 60.0:
-                        return
-                self.processed_msg_hashes[voice_fb_key] = time.time()
+            # Voice KHÔNG có ID thật:
+            # Dùng msg_id + duration + timestamp để phân biệt từng tin riêng biệt
+            # KHÔNG dùng msg_hash vì mọi "[Tin nhắn thoại]%%%30" đều ra cùng hash
+            voice_duration = msg.split("%%%")[1] if "%%%" in msg else "-1"
+            voice_ts_key   = f"VOICE_FB_{conversation_id}_{voice_duration}_{int(time.time() // 5)}"
+            # Cửa sổ 5 giây: cùng nhóm + cùng độ dài + cùng giây → mới là trùng
+            if voice_ts_key in self.processed_msg_hashes:
+                return
+            self.processed_msg_hashes[voice_ts_key] = time.time()
+            # Dọn key cũ quá 120s tránh RAM leak
+            now_ts = time.time()
+            stale = [k for k, v in list(self.processed_msg_hashes.items())
+                     if k.startswith("VOICE_FB_") and now_ts - v > 120]
+            for k in stale:
+                self.processed_msg_hashes.pop(k, None)
 
         # Luôn cập nhật mốc mới nhất (cả voice lẫn text)
         self.last_msg_per_group[conversation_id] = (msg_id, msg_hash, time.time())
@@ -1671,13 +1673,63 @@ class ZAutoProApp(MDApp):
                         if group_names:
                             Clock.schedule_once(lambda dt, g=group_names: self.update_group_list_ui(g), 0)
 
-                    elif action in ('WEB_NEW_MSG', 'WEB_NEW_VOICE', 'WEB_NEW_PHOTO'):
-                        group = payload.get('group_name', '')
-                        msg = payload.get('text', '') or payload.get('voice_url', '') or payload.get('photo_url', '')
-                        msg_id = payload.get('msg_id', '')
+                    elif action == 'WEB_NEW_MSG':
+                        group   = payload.get('group_name', '')
+                        msg     = payload.get('text', '')
+                        msg_id  = payload.get('msg_id', '')
                         conv_id = payload.get('group_id', '')
                         if group and msg:
-                            ev_payload = {'group': group, 'msg': msg, 'msg_id': msg_id, 'conversation_id': conv_id}
+                            ev_payload = {
+                                'group': group, 'msg': msg,
+                                'msg_id': msg_id, 'conversation_id': conv_id
+                            }
+                            try:
+                                self.msg_queue.put(('WEB_NEW_MSG', ev_payload), timeout=0.3)
+                            except queue.Full: pass
+ 
+                    elif action == 'WEB_NEW_VOICE':
+                        # Node.js gửi tin thoại kèm URL file — cần đánh dấu rõ là VOICE
+                        group       = payload.get('group_name', '')
+                        voice_url   = payload.get('voice_url', '')
+                        msg_id      = payload.get('msg_id', '')
+                        conv_id     = payload.get('group_id', '')
+                        sender_name = payload.get('sender_name', '')
+                        # raw_data để gửi quote đúng chuẩn Zalo API
+                        raw_data    = payload.get('raw_data', {})
+                        duration    = -1
+                        try:
+                            # propertyExt có thể chứa "duration":30
+                            prop = raw_data.get('propertyExt', {})
+                            if isinstance(prop, dict):
+                                duration = int(prop.get('duration', -1))
+                        except: pass
+ 
+                        if group and voice_url:
+                            # Tạo msg chuẩn để _process_heavy_message nhận ra là VOICE
+                            prefix = f"{sender_name}: " if sender_name else ""
+                            msg = f"{prefix}[Tin nhắn thoại]%%%{duration}"
+                            ev_payload = {
+                                'group': group, 'msg': msg,
+                                'msg_id': msg_id, 'conversation_id': conv_id,
+                                'is_voice': True, 'voice_url': voice_url,
+                                'raw_data': raw_data
+                            }
+                            try:
+                                self.msg_queue.put(('WEB_NEW_MSG', ev_payload), timeout=0.3)
+                            except queue.Full: pass
+ 
+                    elif action == 'WEB_NEW_PHOTO':
+                        group   = payload.get('group_name', '')
+                        msg_id  = payload.get('msg_id', '')
+                        conv_id = payload.get('group_id', '')
+                        # Ảnh: chỉ hiển thị thẻ, không auto-chốt
+                        if group:
+                            ev_payload = {
+                                'group': group,
+                                'msg': '[Hình ảnh]',
+                                'msg_id': msg_id,
+                                'conversation_id': conv_id
+                            }
                             try:
                                 self.msg_queue.put(('WEB_NEW_MSG', ev_payload), timeout=0.3)
                             except queue.Full: pass
@@ -1817,53 +1869,58 @@ class ZAutoProApp(MDApp):
         except queue.Full:
             pass
 
-    @run_on_ui_thread
     def _execute_reply_safe(self, payload):
-        """HÀM GỌI XUỐNG JAVA — CHẠY ÂM THẦM, KHÔNG NHẢY TAB, KHÔNG LÀM PHIỀN NGƯỜI DÙNG"""
-        try:
-            if platform == 'android':
-                # BƯỚC 1: Ẩn bàn phím (an toàn, không ảnh hưởng UI)
+        """
+        CHỐT CUỐC AN TOÀN:
+        - switch_tab qua Clock (UI thread) → sau đó gửi qua background (không nested thread)
+        - jnius chỉ được gọi từ đúng 1 background thread, không bao giờ từ UI thread trực tiếp
+        """
+        if platform != 'android' or not getattr(self, 'is_linked', False):
+            return
+ 
+        # Bước 1: Switch sang tab Zalo trên UI Thread qua Clock (an toàn)
+        def _switch_tab(dt):
+            try:
+                self.root.ids.bottom_nav.switch_tab('tab_zalo')
+            except Exception as e_tab:
+                logger.warning(f"switch_tab lỗi: {e_tab}")
+ 
+        Clock.schedule_once(_switch_tab, 0)
+ 
+        # Bước 2: Chạy toàn bộ Java call trong 1 background thread độc lập (KHÔNG spawn từ UI thread)
+        def _bg_send():
+            try:
+                # Chờ tab switch + WebView render xong
+                time.sleep(0.35)
+ 
+                from jnius import autoclass as _ac
+                _PA = _ac('org.kivy.android.PythonActivity')
+                _ZWM = _ac('org.zauto.ZaloWebManager')
+                _act = _PA.mActivity
+ 
+                # Ẩn bàn phím
                 try:
-                    from jnius import autoclass as _ac
-                    _act = _ac('org.kivy.android.PythonActivity').mActivity
-                    _ac('org.zauto.ZaloWebManager').hideKeyboard(_act)
-                except: pass
-
-            if platform == 'android' and getattr(self, 'is_linked', False):
-                from jnius import autoclass
-                PythonActivity = autoclass('org.kivy.android.PythonActivity')
-                current_time_str = time.strftime('%H:%M')
-
-                # BƯỚC 2: Switch sang tab Zalo để WebView có focus nhận touch/click event
-                # (cần thiết cho fallback click/longpress khi API Webpack thất bại)
-                try:
-                    self.root.ids.bottom_nav.switch_tab('tab_zalo')
-                except Exception as e_tab:
-                    logger.warning(f"switch_tab lỗi (bỏ qua): {e_tab}")
-
-                # BƯỚC 3: Gọi sendReply sau 300ms để tab kịp switch xong
-                import threading
-                def _do_send_delayed():
-                    import time as _time
-                    _time.sleep(0.3)
-                    try:
-                        from jnius import autoclass as _ac2
-                        _PythonActivity = _ac2('org.kivy.android.PythonActivity')
-                        _ac2('org.zauto.ZaloWebManager').sendReplyToSpecificMessage(
-                            _PythonActivity.mActivity,
-                            payload.get('conversation_id', ''),
-                            payload.get('msg_id', ''),
-                            payload.get('reply_text', ''),
-                            payload.get('msg_content', ''),
-                            _time.strftime('%H:%M')
-                        )
-                        logger.info("Đã gửi lệnh chốt Zalo (có switch_tab + focus)")
-                    except Exception as e_send:
-                        logger.error(f"Lỗi _do_send_delayed: {e_send}")
-                threading.Thread(target=_do_send_delayed, daemon=True).start()
-
-        except Exception as e:
-            logger.error(f"Lỗi _execute_reply_safe: {traceback.format_exc()}")
+                    _ZWM.hideKeyboard(_act)
+                except Exception as ek:
+                    logger.warning(f"hideKeyboard lỗi: {ek}")
+ 
+                # Gửi reply đè tin cũ
+                _ZWM.sendReplyToSpecificMessage(
+                    _act,
+                    payload.get('conversation_id', ''),
+                    payload.get('msg_id', ''),
+                    payload.get('reply_text', ''),
+                    payload.get('msg_content', ''),
+                    time.strftime('%H:%M')
+                )
+                logger.info(f"[CHOT] Đã gửi lệnh cho nhóm: {payload.get('group', '')}")
+ 
+            except Exception as e_bg:
+                logger.error(f"Lỗi _bg_send: {traceback.format_exc()}")
+ 
+        import threading
+        threading.Thread(target=_bg_send, daemon=True).start()
+ 
     
     def load_config(self):
         try:
