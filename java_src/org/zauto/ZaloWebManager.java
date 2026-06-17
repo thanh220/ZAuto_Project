@@ -901,39 +901,63 @@ public class ZaloWebManager {
                 "} catch(e) { console.log('ZAuto fatal:',String(e)); ZAutoBridge.onLoginSuccess('TRIGGER_VISION_FALLBACK',''); }" +
                 "})();";
 
-                // Tạm thời đưa WebView vào viewport để JS click/touch hoạt động
-                // (chỉ cần 1x1px visible là đủ — không cần full screen)
+                // Đưa WebView vào viewport TẠM THỜI (chỉ 1x1px) để JS có thể click/touch
+                // Toàn bộ layout operation phải nằm trong activity.runOnUiThread
                 try {
-                    ViewGroup.LayoutParams lp = webLayout.getLayoutParams();
-                    if (lp instanceof FrameLayout.LayoutParams) {
-                        FrameLayout.LayoutParams flp = (FrameLayout.LayoutParams) lp;
-                        int oldLeft = flp.leftMargin;
-                        int oldTop  = flp.topMargin;
-                        flp.leftMargin = 0;
-                        flp.topMargin  = 0;
-                        webLayout.setLayoutParams(flp);
-                        webLayout.requestLayout();
-                        hiddenWebView.bringToFront();
-                        hiddenWebView.requestFocus();
-
-                        // Chạy JS sau 150ms (đủ để Android layout xong)
-                        hiddenWebView.postDelayed(() -> {
-                            hiddenWebView.evaluateJavascript(jsCode, null);
-                            // Ẩn lại sau 8 giây (đủ cho toàn bộ flow click+send xong)
+                    final String jsCodeFinal = jsCode;
+                    Activity safeAct = activityRef != null ? activityRef.get() : safeActivity;
+                    if (safeAct == null) return;
+                    safeAct.runOnUiThread(() -> {
+                        try {
+                            if (webLayout == null || hiddenWebView == null) return;
+                            ViewGroup.LayoutParams lp = webLayout.getLayoutParams();
+                            if (!(lp instanceof FrameLayout.LayoutParams)) {
+                                hiddenWebView.evaluateJavascript(jsCodeFinal, null);
+                                return;
+                            }
+                            FrameLayout.LayoutParams flp = (FrameLayout.LayoutParams) lp;
+                            final int oldLeft = flp.leftMargin;
+                            final int oldTop  = flp.topMargin;
+                            final float oldAlpha = webLayout.getAlpha();
+ 
+                            // Đưa vào góc (0,0) + alpha 1 để JS touch/click hoạt động
+                            flp.leftMargin = 0;
+                            flp.topMargin  = 0;
+                            webLayout.setAlpha(0.01f); // Không hiện lên mắt người dùng
+                            webLayout.setLayoutParams(flp);
+                            webLayout.requestLayout();
+                            hiddenWebView.bringToFront();
+                            hiddenWebView.requestFocus();
+ 
+                            // Chạy JS sau 200ms (đủ để Android layout + render xong)
                             hiddenWebView.postDelayed(() -> {
-                                try {
-                                    flp.leftMargin = oldLeft;
-                                    flp.topMargin  = oldTop;
-                                    webLayout.setLayoutParams(flp);
-                                    webLayout.requestLayout();
-                                } catch (Exception ignored) {}
-                            }, 8000);
-                        }, 150);
-                    } else {
-                        hiddenWebView.evaluateJavascript(jsCode, null);
-                    }
-                } catch (Exception layoutEx) {
-                    hiddenWebView.evaluateJavascript(jsCode, null);
+                                if (hiddenWebView == null) return;
+                                hiddenWebView.evaluateJavascript(jsCodeFinal, null);
+                                Log.d(TAG, "JS injected for sendReply");
+ 
+                                // Ẩn lại sau 9 giây (đủ cho click+longpress+enter xong)
+                                hiddenWebView.postDelayed(() -> {
+                                    try {
+                                        if (webLayout == null) return;
+                                        flp.leftMargin = oldLeft;
+                                        flp.topMargin  = oldTop;
+                                        webLayout.setAlpha(oldAlpha);
+                                        webLayout.setLayoutParams(flp);
+                                        webLayout.requestLayout();
+                                        Log.d(TAG, "WebView restored to off-screen");
+                                    } catch (Exception ignored) {}
+                                }, 9000);
+                            }, 200);
+ 
+                        } catch (Exception layoutEx) {
+                            Log.e(TAG, "Layout error in sendReply", layoutEx);
+                            if (hiddenWebView != null)
+                                hiddenWebView.evaluateJavascript(jsCodeFinal, null);
+                        }
+                    });
+                } catch (Exception outerEx) {
+                    Log.e(TAG, "sendReply outer error", outerEx);
+                    safeEvaluateJs(jsCode);
                 }
             } catch (Exception e) {
                 Log.e(TAG, "Reply Engine Error", e);
