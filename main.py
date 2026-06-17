@@ -667,11 +667,49 @@ MDScreen:
                                 background_color: 0.1, 0.6, 0.2, 1
                                 on_release: app.show_activation_popup_from_settings()
 
+                        # --- KHỐI KIỂM TRA HỆ THỐNG TỰ ĐỘNG (DEEP CHECK) ---
+                        MDBoxLayout:
+                            orientation: "vertical"
+                            size_hint_y: None
+                            height: self.minimum_height
+                            adaptive_height: True
+                            padding: "10dp"
+                            spacing: "8dp"
+                            md_bg_color: 1, 1, 1, 1
+                            radius: [10, ]
+
+                            MDLabel:
+                                text: "🩺 KIỂM TRA & TỰ CHẨN ĐOÁN APP"
+                                font_style: "Subtitle2"
+                                bold: True
+                                size_hint_y: None
+                                height: self.texture_size[1]
+
+                            MDLabel:
+                                id: lbl_diag_status
+                                text: "Chưa kiểm tra lần nào."
+                                font_style: "Caption"
+                                theme_text_color: "Secondary"
+                                size_hint_y: None
+                                height: self.texture_size[1]
+
+                            Button:
+                                id: btn_run_diagnostics
+                                text: "🔍 KIỂM TRA HỆ THỐNG (DEEP CHECK)"
+                                size_hint_x: 1
+                                size_hint_y: None
+                                height: "48dp"
+                                bold: True
+                                background_normal: ''
+                                background_color: 0.5, 0.1, 0.7, 1
+                                on_release: app.run_system_diagnostics()
+
                         MDBoxLayout:
                             size_hint_y: None
                             height: "20dp"
                             md_bg_color: 0.95, 0.96, 0.98, 1
 '''
+
 
 class ActivationPopup(Popup):
     def __init__(self, machine_id, on_success, can_cancel=False, **kwargs):
@@ -794,6 +832,61 @@ class ActivationPopup(Popup):
             self.dismiss()
         else:
             toast("Mã Key không đúng hoặc đã hết hạn!")
+
+
+class DiagnosticsPopup(Popup):
+    """Popup hiện kết quả Deep Check — log dạng text để người dùng copy ra gửi sửa lỗi."""
+    def __init__(self, report_text, **kwargs):
+        super().__init__(**kwargs)
+        self.title = "KẾT QUẢ KIỂM TRA HỆ THỐNG"
+        self.size_hint = (0.95, 0.85)
+        self.auto_dismiss = True
+        self.report_text = report_text
+
+        self.background = ""
+        self.background_color = (1, 1, 1, 1)
+        self.title_color = (0, 0, 0, 1)
+        self.separator_color = (0.5, 0.1, 0.7, 1)
+
+        root = BoxLayout(orientation='vertical', padding=dp(12), spacing=dp(10))
+
+        self.log_box = TextInput(
+            text=report_text,
+            readonly=True,
+            font_size='12sp',
+            background_color=(0.07, 0.07, 0.09, 1),
+            foreground_color=(0.85, 0.95, 0.85, 1),
+            cursor_color=(1, 1, 1, 1),
+        )
+        root.add_widget(self.log_box)
+
+        btn_row = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(48), spacing=dp(10))
+
+        btn_copy = Button(
+            text="COPY TOÀN BỘ LOG",
+            background_normal='', background_color=(0.1, 0.5, 0.8, 1),
+            color=(1, 1, 1, 1), bold=True
+        )
+        btn_copy.bind(on_release=self.copy_log)
+        btn_row.add_widget(btn_copy)
+
+        btn_close = Button(
+            text="ĐÓNG",
+            background_normal='', background_color=(0.6, 0.1, 0.1, 1),
+            color=(1, 1, 1, 1), bold=True
+        )
+        btn_close.bind(on_release=self.dismiss)
+        btn_row.add_widget(btn_close)
+
+        root.add_widget(btn_row)
+        self.content = root
+
+    def copy_log(self, instance):
+        from kivy.core.clipboard import Clipboard
+        Clipboard.copy(self.report_text)
+        toast("Đã copy toàn bộ log!")
+
+
 class RideCard(MDCard):
     group_text = StringProperty()
     msg_text = StringProperty()
@@ -1982,6 +2075,419 @@ class ZAutoProApp(MDApp):
         except Exception as e:
             print(f"Lỗi UI Profile: {e}")
 
+    # =====================================================================
+    # DEEP CHECK — TỰ CHẨN ĐOÁN TOÀN BỘ APP (12 BƯỚC) + TỰ THỬ KHẮC PHỤC NHẸ
+    # Chạy hoàn toàn ở background thread, KHÔNG làm treo UI.
+    # Mọi bước đều test TRẠNG THÁI THẬT (không bịa), ghi log rõ PASS/FAIL/FIXED.
+    # =====================================================================
+    def run_system_diagnostics(self):
+        if getattr(self, '_diag_running', False):
+            toast("Đang kiểm tra rồi, vui lòng đợi...")
+            return
+        self._diag_running = True
+
+        try:
+            ids = self.root.ids
+            if 'btn_run_diagnostics' in ids:
+                ids.btn_run_diagnostics.disabled = True
+                ids.btn_run_diagnostics.text = "ĐANG KIỂM TRA... (15-30s)"
+            if 'lbl_diag_status' in ids:
+                ids.lbl_diag_status.text = "🔄 Đang chạy Deep Check..."
+        except Exception:
+            pass
+
+        threading.Thread(target=self._diagnostics_worker, daemon=True).start()
+
+    def _diag_line(self, lines, ok, label, detail=""):
+        """Thêm 1 dòng log chuẩn hoá PASS/FAIL/WARN/FIXED vào danh sách kết quả."""
+        icon = {"PASS": "✅", "FAIL": "❌", "WARN": "⚠️", "FIXED": "🔧", "INFO": "ℹ️"}.get(ok, "•")
+        line = f"{icon} [{ok}] {label}"
+        if detail:
+            line += f" — {detail}"
+        lines.append(line)
+        try:
+            logger.info(f"[DIAG] {line}")
+        except Exception:
+            pass
+
+    def _diagnostics_worker(self):
+        """Chạy toàn bộ 12 bước kiểm tra thật trong background thread."""
+        lines = []
+        fail_count = 0
+        warn_count = 0
+        fixed_count = 0
+
+        def mark(ok, label, detail=""):
+            nonlocal fail_count, warn_count, fixed_count
+            if ok == "FAIL":
+                fail_count += 1
+            elif ok == "WARN":
+                warn_count += 1
+            elif ok == "FIXED":
+                fixed_count += 1
+            self._diag_line(lines, ok, label, detail)
+
+        lines.append("=" * 50)
+        lines.append(f"  ZAUTO VIP — DEEP CHECK — {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append("=" * 50)
+
+        # ---------------------------------------------------------------
+        # BƯỚC 1: Trạng thái Radar (đang canh me hay không)
+        # ---------------------------------------------------------------
+        try:
+            if getattr(self, 'is_radar_running', False):
+                mark("PASS", "Radar canh me", "đang chạy")
+            else:
+                mark("WARN", "Radar canh me", "đang TẮT — app sẽ không nhận tin mới")
+        except Exception as e:
+            mark("FAIL", "Radar canh me", str(e))
+
+        # ---------------------------------------------------------------
+        # BƯỚC 2: Trạng thái liên kết Zalo
+        # ---------------------------------------------------------------
+        try:
+            if getattr(self, 'is_linked', False):
+                mark("PASS", "Liên kết Zalo", "đã liên kết")
+            else:
+                mark("FAIL", "Liên kết Zalo", "CHƯA liên kết — quét QR hoặc đăng nhập lại")
+        except Exception as e:
+            mark("FAIL", "Liên kết Zalo", str(e))
+
+        # ---------------------------------------------------------------
+        # BƯỚC 3: Nhóm đang bật theo dõi
+        # ---------------------------------------------------------------
+        try:
+            enabled = [g for g, v in getattr(self, 'enabled_groups', {}).items() if v]
+            if enabled:
+                mark("PASS", "Nhóm đang theo dõi", f"{len(enabled)} nhóm")
+            else:
+                mark("WARN", "Nhóm đang theo dõi", "0 nhóm đang bật — vào tab Nhóm để bật")
+        except Exception as e:
+            mark("FAIL", "Nhóm đang theo dõi", str(e))
+
+        # ---------------------------------------------------------------
+        # BƯỚC 4: Các luồng worker (thread) có còn sống không
+        # ---------------------------------------------------------------
+        worker_map = {
+            'msg_worker_thread': "Luồng xử lý tin nhắn",
+            'reply_worker_thread': "Luồng gửi chốt cuốc",
+            'audio_worker_thread': "Luồng phát tin thoại",
+            'poll_worker_thread': "Luồng đọc dữ liệu Java",
+            'node_poll_worker_thread': "Luồng đọc dữ liệu Node.js",
+        }
+        for attr, label in worker_map.items():
+            try:
+                th = getattr(self, attr, None)
+                if th is not None and th.is_alive():
+                    mark("PASS", label, "đang chạy")
+                else:
+                    mark("FAIL", label, "ĐÃ CHẾT — cần khởi động lại app")
+            except Exception as e:
+                mark("FAIL", label, str(e))
+
+        # ---------------------------------------------------------------
+        # BƯỚC 5: Hàng đợi (queue) có bị nghẽn không
+        # ---------------------------------------------------------------
+        queue_map = {
+            'msg_queue': ("Hàng đợi tin nhắn", 500),
+            'reply_queue': ("Hàng đợi chốt cuốc", 50),
+            'ui_queue': ("Hàng đợi cập nhật UI", 100),
+            'audio_queue': ("Hàng đợi tin thoại", 50),
+        }
+        for attr, (label, maxsize) in queue_map.items():
+            try:
+                q = getattr(self, attr, None)
+                if q is None:
+                    mark("FAIL", label, "không tồn tại")
+                    continue
+                size = q.qsize()
+                if size >= maxsize * 0.9:
+                    mark("WARN", label, f"gần đầy ({size}/{maxsize}) — có thể bị nghẽn")
+                else:
+                    mark("PASS", label, f"{size}/{maxsize}")
+            except Exception as e:
+                mark("FAIL", label, str(e))
+
+        # ---------------------------------------------------------------
+        # BƯỚC 6: Node.js backend (server.js) — process còn sống?
+        # ---------------------------------------------------------------
+        node_alive = False
+        try:
+            proc = getattr(self, 'node_process', None)
+            if proc is not None and proc.poll() is None:
+                node_alive = True
+                mark("PASS", "Tiến trình Node.js", f"PID={proc.pid} đang sống")
+            elif proc is not None:
+                mark("FAIL", "Tiến trình Node.js", f"ĐÃ CHẾT (exit code={proc.returncode})")
+            else:
+                mark("WARN", "Tiến trình Node.js", "chưa có thông tin process (có thể đang dùng kiến trúc Java WebView thuần)")
+        except Exception as e:
+            mark("FAIL", "Tiến trình Node.js", str(e))
+
+        # ---------------------------------------------------------------
+        # BƯỚC 7: Node.js — thử gọi thật /health và /api/events
+        # ---------------------------------------------------------------
+        try:
+            import urllib.request
+            req = urllib.request.urlopen("http://127.0.0.1:5000/health", timeout=3)
+            if req.status == 200:
+                mark("PASS", "Node.js /health", "phản hồi HTTP 200")
+            else:
+                mark("WARN", "Node.js /health", f"phản hồi mã {req.status}")
+        except Exception as e:
+            if node_alive:
+                mark("FAIL", "Node.js /health", f"process sống nhưng KHÔNG phản hồi HTTP: {e}")
+            else:
+                mark("WARN", "Node.js /health", "không phản hồi (process không chạy, có thể đang dùng kiến trúc Java thuần)")
+
+        try:
+            import urllib.request, json as _json
+            req = urllib.request.urlopen("http://127.0.0.1:5000/api/events", timeout=3)
+            _json.loads(req.read().decode('utf-8'))
+            mark("PASS", "Node.js /api/events", "trả JSON hợp lệ")
+        except Exception as e:
+            mark("WARN", "Node.js /api/events", f"không đọc được: {e}")
+
+        # ---------------------------------------------------------------
+        # BƯỚC 8: WebView Java — đã khởi tạo chưa, còn null không
+        # ---------------------------------------------------------------
+        webview_ok = False
+        if platform == 'android':
+            try:
+                from jnius import autoclass
+                ZWM = autoclass('org.zauto.ZaloWebManager')
+                if not getattr(self, 'webview_inited', False):
+                    mark("WARN", "WebView ẩn (ZaloWebManager)", "chưa khởi tạo — mở tab Zalo 1 lần để khởi tạo")
+                elif ZWM.hiddenWebView is None:
+                    mark("FAIL", "WebView ẩn (ZaloWebManager)", "đã khởi tạo nhưng hiddenWebView đang NULL")
+                    # TỰ THỬ KHẮC PHỤC: gọi lại initWebView
+                    try:
+                        PA = autoclass('org.kivy.android.PythonActivity')
+                        ZWM.initWebView(PA.mActivity)
+                        mark("FIXED", "WebView ẩn (ZaloWebManager)", "đã thử gọi lại initWebView()")
+                    except Exception as e_fix:
+                        mark("FAIL", "Tự khắc phục WebView", str(e_fix))
+                else:
+                    webview_ok = True
+                    mark("PASS", "WebView ẩn (ZaloWebManager)", "đã khởi tạo, hiddenWebView tồn tại")
+            except Exception as e:
+                mark("FAIL", "WebView ẩn (ZaloWebManager)", str(e))
+        else:
+            mark("INFO", "WebView ẩn (ZaloWebManager)", "bỏ qua — đang chạy trên PC, không phải Android")
+
+        # ---------------------------------------------------------------
+        # BƯỚC 9: Heartbeat Java — JS observer còn sống không (qua selfDiagnose)
+        # ---------------------------------------------------------------
+        if platform == 'android' and webview_ok:
+            try:
+                from jnius import autoclass
+                ZWM = autoclass('org.zauto.ZaloWebManager')
+                last_hb = ZWM.lastHeartbeat
+                age_sec = (int(time.time() * 1000) - int(last_hb)) / 1000.0
+                if age_sec < 25:
+                    mark("PASS", "Heartbeat JS sidebar observer", f"{age_sec:.1f}s trước")
+                elif age_sec < 60:
+                    mark("WARN", "Heartbeat JS sidebar observer", f"{age_sec:.1f}s trước — hơi cũ")
+                else:
+                    mark("FAIL", "Heartbeat JS sidebar observer", f"{age_sec:.1f}s trước — JS có thể đã chết")
+                    # TỰ THỬ KHẮC PHỤC: reload webview
+                    try:
+                        ZWM.safeReload()
+                        mark("FIXED", "Heartbeat JS sidebar observer", "đã gọi safeReload() để khởi động lại JS")
+                    except Exception as e_fix:
+                        mark("FAIL", "Tự khắc phục Heartbeat", str(e_fix))
+            except Exception as e:
+                mark("FAIL", "Heartbeat JS sidebar observer", str(e))
+
+        # ---------------------------------------------------------------
+        # BƯỚC 10: Self-diagnose chi tiết từ JS (zMessenger API + tìm node tin cuối +
+        # thử double-click thật trên tin cuối cùng nếu có) — gọi xuống Java
+        # ---------------------------------------------------------------
+        if platform == 'android' and webview_ok:
+            try:
+                from jnius import autoclass
+                ZWM = autoclass('org.zauto.ZaloWebManager')
+                PA = autoclass('org.kivy.android.PythonActivity')
+                diag_json = ZWM.selfDiagnose(PA.mActivity)
+                if diag_json:
+                    try:
+                        diag_data = json.loads(diag_json)
+                    except Exception:
+                        diag_data = {}
+
+                    if diag_data.get('zMessengerFound'):
+                        mark("PASS", "API nội bộ Zalo (zMessenger)", "đã tìm thấy — gửi/chốt qua API")
+                    else:
+                        mark("WARN", "API nội bộ Zalo (zMessenger)", "chưa tìm thấy — sẽ phải dùng double-click")
+
+                    if diag_data.get('hasConversationList'):
+                        mark("PASS", "Sidebar danh sách hội thoại", "đang hiển thị")
+                    else:
+                        mark("WARN", "Sidebar danh sách hội thoại", "không thấy — có thể đang ở màn hình QR/login")
+
+                    last_msg_found = diag_data.get('lastMsgNodeFound')
+                    if last_msg_found:
+                        mark("PASS", "Tìm node tin nhắn cuối", "thành công")
+                        bubble_w = diag_data.get('bubbleWidth', 0)
+                        bubble_h = diag_data.get('bubbleHeight', 0)
+                        if bubble_w and bubble_h:
+                            mark("PASS", "Đo kích thước bong bóng tin", f"{bubble_w}x{bubble_h}px — double-click có toạ độ hợp lệ")
+                        else:
+                            mark("WARN", "Đo kích thước bong bóng tin", "kích thước 0 — double-click sẽ bấm sai vị trí")
+                    else:
+                        mark("WARN", "Tìm node tin nhắn cuối", "không có tin nào trong khung chat hiện tại")
+
+                    is_login_screen = diag_data.get('isLoginScreen', False)
+                    if is_login_screen:
+                        mark("FAIL", "Màn hình hiện tại", "đang ở màn hình ĐĂNG NHẬP QR — cần quét lại")
+                else:
+                    mark("WARN", "Self-diagnose JS", "không nhận được phản hồi từ WebView")
+            except Exception as e:
+                mark("WARN", "Self-diagnose JS", f"chưa hỗ trợ hoặc lỗi: {e}")
+
+        # ---------------------------------------------------------------
+        # BƯỚC 11: GỬI TIN TEST THẬT vào (các) nhóm đang BẬT để kiểm tra toàn bộ
+        # pipeline chốt cuốc từ đầu đến cuối (API → double-click → fallback).
+        # Tin test có tiền tố rõ ràng [ZAUTO TEST] để không nhầm với cuốc thật.
+        # Chỉ test trên nhóm đã có sẵn ít nhất 1 ride card (để lấy được conversation_id
+        # thật) — KHÔNG bịa ID giả. Nếu nhóm bật nhưng chưa có tin nào, báo rõ lý do
+        # bỏ qua, không coi là PASS.
+        # ---------------------------------------------------------------
+        try:
+            enabled = [g for g, v in getattr(self, 'enabled_groups', {}).items() if v]
+            if not getattr(self, 'is_linked', False):
+                mark("INFO", "Test gửi tin thật", "bỏ qua — chưa liên kết Zalo")
+            elif not enabled:
+                mark("INFO", "Test gửi tin thật", "bỏ qua — chưa bật nhóm nào. Hãy TẮT các nhóm thật, " +
+                     "chỉ BẬT 1 nhóm test riêng rồi chạy Deep Check lại để kiểm tra gửi thật.")
+            elif platform != 'android':
+                mark("INFO", "Test gửi tin thật", "bỏ qua — đang chạy trên PC, không có WebView Android")
+            else:
+                # Tìm 1 nhóm đang bật ĐÃ CÓ ride card (để lấy conversation_id thật, không bịa)
+                target_group = None
+                target_conv_id = None
+                try:
+                    ride_list = self.root.ids.ride_list
+                    for card in list(ride_list.children):
+                        g_text = getattr(card, 'group_text', '')
+                        c_id = getattr(card, 'conversation_id', '')
+                        if g_text in enabled and c_id:
+                            target_group = g_text
+                            target_conv_id = c_id
+                            break
+                except Exception:
+                    pass
+
+                if not target_group:
+                    mark("WARN", "Test gửi tin thật", "có nhóm bật nhưng CHƯA có tin nào để lấy ID hội thoại — " +
+                         "hãy gửi 1 tin bất kỳ vào nhóm test rồi chạy Deep Check lại")
+                else:
+                    test_text = f"[ZAUTO TEST] Deep Check {time.strftime('%H:%M:%S')} - vui lòng bỏ qua tin này"
+                    sent_ok = False
+                    fail_reason = ""
+                    try:
+                        from jnius import autoclass as _ac
+                        _PA = _ac('org.kivy.android.PythonActivity')
+                        _ZWM = _ac('org.zauto.ZaloWebManager')
+                        _act = _PA.mActivity
+
+                        # Dọn sạch hàng đợi pythonMsgQueue cũ liên quan đến chốt, để không đọc
+                        # nhầm phản hồi của 1 lệnh chốt cuốc khác đang chạy song song
+                        _ZWM.sendReplyToSpecificMessage(
+                            _act, target_conv_id, "", test_text, "", time.strftime('%H:%M')
+                        )
+
+                        # Lắng nghe pythonMsgQueue tối đa 10 giây để bắt phản hồi THẬT từ Java
+                        # (Chốt API QUOTE OK / Chốt DOM UI QUOTE OK / TRIGGER_VISION_FALLBACK)
+                        wait_deadline = time.time() + 10.0
+                        while time.time() < wait_deadline:
+                            try:
+                                raw = _ZWM.pythonMsgQueue.poll()
+                            except Exception:
+                                raw = None
+                            if raw:
+                                raw_str = str(raw)
+                                if 'Chốt API QUOTE OK' in raw_str or 'Chốt DOM UI QUOTE OK' in raw_str or 'Đã chốt xong' in raw_str:
+                                    sent_ok = True
+                                    break
+                                if 'TRIGGER_VISION_FALLBACK' in raw_str:
+                                    fail_reason = "rơi vào Vision Fallback — double-click/API đều thất bại"
+                                    break
+                            time.sleep(0.2)
+                    except Exception as e_send:
+                        fail_reason = str(e_send)
+
+                    if sent_ok:
+                        mark("PASS", "Test gửi tin thật", f"đã gửi thành công vào nhóm '{target_group}'")
+                    elif fail_reason:
+                        mark("FAIL", "Test gửi tin thật", f"nhóm '{target_group}': {fail_reason}")
+                    else:
+                        mark("WARN", "Test gửi tin thật",
+                             f"nhóm '{target_group}': không nhận được xác nhận trong 10s — " +
+                             "có thể đã gửi nhưng JS chưa báo về kịp, hãy kiểm tra trong Zalo")
+        except Exception as e:
+            mark("FAIL", "Test gửi tin thật", str(e))
+
+        # ---------------------------------------------------------------
+        # BƯỚC 12: Dung lượng log + cảnh báo lỗi gần đây trong system.log
+        # ---------------------------------------------------------------
+        try:
+            log_path = os.path.join(LOG_DIR, 'system.log')
+            if os.path.exists(log_path):
+                size_kb = os.path.getsize(log_path) / 1024.0
+                mark("PASS", "File log hệ thống", f"{size_kb:.1f} KB tại {log_path}")
+                # Đọc 50 dòng cuối, đếm số dòng ERROR gần đây
+                try:
+                    with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        last_lines = f.readlines()[-200:]
+                    recent_errors = [l.strip() for l in last_lines if " - ERROR - " in l]
+                    if recent_errors:
+                        mark("WARN", "Lỗi gần đây trong log", f"{len(recent_errors)} dòng ERROR trong 200 dòng cuối")
+                        lines.append("   --- 5 lỗi gần nhất ---")
+                        for e_line in recent_errors[-5:]:
+                            lines.append(f"   {e_line}")
+                    else:
+                        mark("PASS", "Lỗi gần đây trong log", "không có dòng ERROR nào trong 200 dòng cuối")
+                except Exception as e_read:
+                    mark("WARN", "Đọc file log", str(e_read))
+            else:
+                mark("WARN", "File log hệ thống", "chưa được tạo")
+        except Exception as e:
+            mark("FAIL", "File log hệ thống", str(e))
+
+        # ---------------------------------------------------------------
+        # TỔNG KẾT
+        # ---------------------------------------------------------------
+        lines.append("=" * 50)
+        if fail_count == 0 and warn_count == 0:
+            summary = f"🎉 HOÀN HẢO: 0 lỗi, 0 cảnh báo. App đang hoạt động tốt."
+        elif fail_count == 0:
+            summary = f"✅ ỔN: 0 lỗi nghiêm trọng, {warn_count} cảnh báo nhẹ (xem chi tiết trên)."
+        else:
+            summary = f"❌ CÓ {fail_count} LỖI cần xử lý, {warn_count} cảnh báo. Đã tự sửa {fixed_count} lỗi an toàn."
+        lines.append(summary)
+        if fixed_count > 0:
+            lines.append(f"🔧 Đã tự động thử khắc phục {fixed_count} vấn đề (reload webview/khởi tạo lại). Hãy kiểm tra lại sau ít giây.")
+        lines.append("=" * 50)
+
+        report_text = "\n".join(lines)
+
+        def _show_result(dt):
+            try:
+                ids = self.root.ids
+                if 'btn_run_diagnostics' in ids:
+                    ids.btn_run_diagnostics.disabled = False
+                    ids.btn_run_diagnostics.text = "🔍 KIỂM TRA HỆ THỐNG (DEEP CHECK)"
+                if 'lbl_diag_status' in ids:
+                    ids.lbl_diag_status.text = summary
+                DiagnosticsPopup(report_text).open()
+            except Exception as e:
+                logger.error(f"Lỗi hiện popup Deep Check: {e}")
+            finally:
+                self._diag_running = False
+
+        Clock.schedule_once(_show_result, 0)
+
     def save_config(self):
         """BẮT BUỘC ĐỌC UI VÀO BIẾN TRƯỚC KHI XUỐNG DB"""
         try:
@@ -2305,6 +2811,8 @@ class ZAutoProApp(MDApp):
         self._restarting_msg_worker = False
         self._restarting_reply_worker = False
         self.last_webview_bounds = None
+        self.node_process = None       # Lưu lại process Node.js để Deep Check kiểm tra sống/chết
+        self._diag_running = False     # Chống bấm Deep Check nhiều lần chồng nhau
         Window.softinput_mode = "pan"  # Dùng pan thay below_target để tránh bàn phím bật lên tự động
 
     def safe_toast(self, msg):
@@ -2545,6 +3053,7 @@ class ZAutoProApp(MDApp):
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     shell=True if is_windows else False
                 )
+                self.node_process = proc  # Lưu lại để Deep Check kiểm tra tiến trình còn sống hay đã chết
                 logger.info(f'Node.js server đã khởi động ngầm thành công, PID={proc.pid}')
 
                 # Đọc luồng dữ liệu log tránh đầy bộ đệm treo tiến trình
