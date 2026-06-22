@@ -72,7 +72,7 @@ public class ZaloWebManager {
             new Handler(Looper.getMainLooper()).postDelayed(() -> {
                 isSending = false;
                 processReplyQueue();
-            }, 2500);
+            }, 800); // Giảm từ 2500ms → 800ms: chỉ cần đủ tránh race condition JS
         } else {
             isSending = false;
         }
@@ -166,9 +166,22 @@ public class ZaloWebManager {
 				// ── DUCK TYPING helper: nhận dạng đúng object API của Zalo ──────────
 				"   var _isApi = function(obj) {" +
 				"       if (!obj || typeof obj !== 'object') return false;" +
-				// Zalo bắt buộc phải có sendMessage + (sendMsg HOẶC sendTextMessage)
-				"       return typeof obj.sendMessage==='function' && " +
-				"              (typeof obj.sendMsg==='function' || typeof obj.sendTextMessage==='function');" +
+				// Tầng 1: đặc trưng mạnh nhất — có sendMessage + ít nhất 1 trong các hàm gửi khác
+				"       if (typeof obj.sendMessage==='function' && (" +
+				"           typeof obj.sendMsg==='function' ||" +
+				"           typeof obj.sendTextMessage==='function' ||" +
+				"           typeof obj.sendQuoteMsg==='function' ||" +
+				"           typeof obj.replyToMessage==='function' ||" +
+				"           typeof obj.replyMessage==='function'" +
+				"       )) return true;" +
+				// Tầng 2: Zalo mới có thể đổi tên sendMessage → sendMsg hoặc send
+				"       if ((typeof obj.sendMsg==='function' || typeof obj.send==='function') && " +
+				"           (typeof obj.getConversation==='function' || typeof obj.fetchMessages==='function' || typeof obj.loadMore==='function')) return true;" +
+				// Tầng 3: duck typing tối giản — chỉ cần sendMessage + toid trong lời gọi mẫu
+				"       if (typeof obj.sendMessage==='function') {" +
+				"           try { var s=String(obj.sendMessage); if(s.includes('toid')||s.includes('convId')||s.includes('toId')) return true; } catch(e){}" +
+				"       }" +
+				"       return false;" +
 				"   };" +
 				"   var _deepFind = function(obj) {" +
 				"       if (_isApi(obj)) { window.zMessenger=obj; return true; }" +
@@ -176,7 +189,14 @@ public class ZaloWebManager {
 				"       var keys=Object.keys(obj);" +
 				"       for(var i=0;i<keys.length;i++){" +
 				"           var c=obj[keys[i]];" +
-				"           if(c && typeof c==='object' && _isApi(c)){window.zMessenger=c;return true;}" +
+				"           if (!c || typeof c!=='object') continue;" +
+				"           if (_isApi(c)){window.zMessenger=c;return true;}" +
+				// Quét thêm 1 cấp nữa (cấp 2) — Zalo Web mới hay bọc thêm 1 lớp
+				"           var keys2=Object.keys(c);" +
+				"           for(var j=0;j<keys2.length;j++){" +
+				"               var c2=c[keys2[j]];" +
+				"               if(c2 && typeof c2==='object' && _isApi(c2)){window.zMessenger=c2;return true;}" +
+				"           }" +
 				"       }" +
 				"       return false;" +
 				"   };" +
@@ -268,51 +288,74 @@ public class ZaloWebManager {
                 // ─────────────────────────────────────────────────────────────
                 // BƯỚC 1: MỞ ĐÚNG NHÓM (GIỮ NGUYÊN + TĂNG TIMEOUT 3500ms)
                 // ─────────────────────────────────────────────────────────────
-                // CODE MỚI — _openGroup tìm theo cả tên nhóm
-				"function _openGroup(cb) {" +
-				"   if (!_convId || _convId==='') {" +
-				// Thử mở bằng tên nhóm (_groupName) — chính xác hơn _search
-				"       var _tryName = _groupName || (_search && _search.length > 1 ? _search.substring(0,20) : '');" +
-				"       if (_tryName && _tryName.length > 1) {" +
-				"           var nameEls = document.querySelectorAll('.conv-item-title__name,[class*=conv-name],[class*=group-name],[class*=ConvItemTitle]');" +
-				"           for (var ni=0; ni<nameEls.length; ni++) {" +
-				"               var elTxt = (nameEls[ni].textContent||'').trim();" +
-				"               if (elTxt === _tryName || elTxt.includes(_tryName.substring(0,15))) {" +
-				"                   var convItem2 = nameEls[ni].closest('.msg-item,.conv-item,[anim-data-id]');" +
-				"                   if (convItem2) {" +
-				"                       convItem2.click();" +
-				// Cập nhật _convId từ DOM để các bước sau dùng được
-				"                       var foundId = convItem2.getAttribute('anim-data-id') || convItem2.getAttribute('data-id') || '';" +
-				"                       if (foundId) _convId = foundId;" +
-				"                       setTimeout(function(){cb(true);},2500); return;" +
-				"                   }" +
-				"               }" +
-				"           }" +
-				"       }" +
-				"       cb(true); return;" +
-				"   }" +
-                // CODE FIX CHUẨN:
-				"   var item = document.querySelector('.msg-item[anim-data-id=\"' + _convId + '\"] .conv-item')" +
-				"           || document.querySelector('.msg-item[anim-data-id=\"' + _convId + '\"]')" +
-				"           || document.querySelector('[id*=\"' + _convId + '\"]');" +
+                // _waitReady: poll 80ms/lần, chạy ngay khi DOM sẵn sàng, không chờ cứng
+                // Dấu hiệu sẵn sàng: có [data-qid] hoặc [id^=message-frame_] trong khung chat
+                // → thực tế chỉ mất 150-400ms thay vì 3500ms cứng
+                "function _waitReady(cb, maxMs) {" +
+                "   var t0=Date.now(); var max=maxMs||3000;" +
+                "   var iv=setInterval(function(){" +
+                "       var ready = document.querySelector('[data-qid]')" +
+                "               || document.querySelector('[id^=\"message-frame_\"]')" +
+                "               || _discoverApi();" +
+                "       if(ready || Date.now()-t0>max){clearInterval(iv);cb(!!ready);}" +
+                "   },80);" +
+                "}" +
+
+                // _findItem: tập trung logic tìm item sidebar vào 1 hàm dùng lại được
+                "function _findItem() {" +
+                "   var item = document.querySelector('.msg-item[anim-data-id=\"'+_convId+'\"] .conv-item')" +
+                "           || document.querySelector('.msg-item[anim-data-id=\"'+_convId+'\"]')" +
+                "           || document.querySelector('[id*=\"'+_convId+'\"]');" +
                 "   if (!item) {" +
-                "       var all = document.querySelectorAll('.msg-item,.conv-item');" +
-                "       for (var i=0;i<all.length;i++) {" +
+                "       var all=document.querySelectorAll('.msg-item,.conv-item');" +
+                "       for(var i=0;i<all.length;i++){" +
                 "           var rk=Object.keys(all[i]).find(k=>k.startsWith('__reactFiber')||k.startsWith('__reactProps'));" +
-                "           if (rk && all[i][rk]) {" +
-                "               var p=all[i][rk].memoizedProps||all[i][rk].pendingProps;" +
-                "               if (p&&((p.session&&String(p.session.id)===_convId)||(p.convId&&String(p.convId)===_convId))) {item=all[i];break;}" +
+                "           if(rk&&all[i][rk]){var p=all[i][rk].memoizedProps||all[i][rk].pendingProps;" +
+                "               if(p&&((p.session&&String(p.session.id)===_convId)||(p.convId&&String(p.convId)===_convId))){item=all[i];break;}}" +
+                "       }" +
+                "   }" +
+                "   if(!item && (_groupName||'').length>1){" +
+                "       var nels=document.querySelectorAll('.conv-item-title__name,[class*=conv-name],[class*=group-name],[class*=ConvItemTitle]');" +
+                "       for(var ni=0;ni<nels.length;ni++){" +
+                "           var et=(nels[ni].textContent||'').trim();" +
+                "           if(et===_groupName||et.includes(_groupName.substring(0,15))){" +
+                "               var ci=nels[ni].closest('.msg-item,.conv-item,[anim-data-id]');" +
+                "               if(ci){var fid=ci.getAttribute('anim-data-id')||ci.getAttribute('data-id')||''; if(fid)_convId=fid; item=ci; break;}" +
                 "           }" +
                 "       }" +
                 "   }" +
-                "   if (!item) { cb(false); return; }" +
-                "   item.scrollIntoView({block:'center'}); item.click();" +
+                "   return item;" +
+                "}" +
+
+                // _clickItem: click item sidebar qua React handler nếu có
+                "function _clickItem(item) {" +
+                "   item.scrollIntoView({block:'center'});" +
+                "   item.click();" +
                 "   var rk=Object.keys(item).find(k=>k.startsWith('__reactEventHandlers')||k.startsWith('__reactFiber'));" +
-                "   if (rk&&item[rk]) {" +
-                "       var h=item[rk].onClick||(item[rk].return&&item[rk].return.memoizedProps&&item[rk].return.memoizedProps.onClick);" +
-                "       if (h) h({preventDefault:function(){},stopPropagation:function(){}});" +
+                "   if(rk&&item[rk]){var h=item[rk].onClick||(item[rk].return&&item[rk].return.memoizedProps&&item[rk].return.memoizedProps.onClick); if(typeof h==='function')h({preventDefault:function(){},stopPropagation:function(){}});}" +
+                "}" +
+
+                "function _openGroup(cb) {" +
+                "   if(!_convId||_convId===''){" +
+                "       var item0=_findItem();" +
+                "       if(item0){_clickItem(item0);_waitReady(cb,2500);}" +
+                "       else cb(true);" +
+                "       return;" +
                 "   }" +
-                "   setTimeout(function(){cb(true);}, 3500);" +
+                "   var item=_findItem();" +
+                "   if(!item){" +
+                // Virtual scroll ẩn node — cuộn sidebar về đầu, đợi 300ms rồi thử lại 1 lần
+                "       var sb=document.querySelector('#conversationListId,.sidebar-container,[class*=SideBarList],[class*=conversation-list]');" +
+                "       if(sb)sb.scrollTop=0;" +
+                "       setTimeout(function(){" +
+                "           var item2=_findItem();" +
+                "           if(item2){_clickItem(item2);_waitReady(cb,2500);}" +
+                "           else cb(false);" +
+                "       },300);" + // 300ms đủ để sidebar re-render sau scroll (giảm từ 800ms)
+                "       return;" +
+                "   }" +
+                "   _clickItem(item);" +
+                "   _waitReady(cb,3000);" + // poll đến khi DOM sẵn sàng, tối đa 3000ms
                 "}" +
 
                 // ─────────────────────────────────────────────────────────────
@@ -891,23 +934,27 @@ public class ZaloWebManager {
                 "   }, 300);" +   // đợi scroll render
                 "}" +
 				// ─────────────────────────────────────────────────────────────
-                // LUỒNG CHẠY CHÍNH (ĐÃ CẬP NHẬT GỌN GÀNG)
+                // ─────────────────────────────────────────────────────────────
+                // LUỒNG CHẠY CHÍNH
+                // _waitReady đã đảm bảo DOM sẵn sàng trước khi gọi cb(true)
+                // → không cần setTimeout thêm, chạy thẳng ngay sau opened=true
                 // ─────────────────────────────────────────────────────────────
                 "_openGroup(function(opened) {" +
-                "   var node    = _findNode();" +
-                "   var ext     = _extractObj(node);" +
-                "   if (!opened) {" +
-                "       console.log('ZAuto: group not opened, retry click convId='+_convId);" +
-                "       var directItem = document.querySelector('[anim-data-id=\"'+_convId+'\"]');" +
-                "       if (directItem) { directItem.click(); }" +
-                "       setTimeout(function() {" +
+                "   if(!opened){" +
+                "       var di=document.querySelector('[anim-data-id=\"'+_convId+'\"]');" +
+                "       if(di){di.scrollIntoView({block:'center'});di.click();}" +
+                "       _waitReady(function(){" +
+                "           _discoverApi();" +
                 "           var n2=_findNode(); var e2=_extractObj(n2);" +
-                "           if (!n2) { ZAutoBridge.onLoginSuccess('TRIGGER_VISION_FALLBACK',''); return; }" +
-                "           _doSend(n2, e2.id, e2.obj);" +
-                "       }, 2000);" +
+                "           if(!n2){ZAutoBridge.onLoginSuccess('OPEN_GROUP_FAIL:'+(_groupName||_convId),'');return;}" +
+                "           _doSend(n2,e2.id,e2.obj);" +
+                "       },2500);" +
                 "       return;" +
                 "   }" +
-                "   _doSend(node, ext.id, ext.obj);" +
+                // _waitReady đã xác nhận DOM có tin nhắn rồi → chạy thẳng, không delay thêm
+                "   _discoverApi();" +
+                "   var node=_findNode(); var ext=_extractObj(node);" +
+                "   _doSend(node,ext.id,ext.obj);" +
                 "});" +
 
                 "} catch(e) { console.log('ZAuto fatal:',String(e)); ZAutoBridge.onLoginSuccess('TRIGGER_VISION_FALLBACK',''); }" +
@@ -941,7 +988,7 @@ public class ZaloWebManager {
                             hiddenWebView.bringToFront();
                             hiddenWebView.requestFocus();
  
-                            // Chạy JS sau 200ms (đủ để Android layout + render xong)
+                            // Chạy JS sau 50ms (layout Android xong trong ~16ms/1 frame)
                             hiddenWebView.postDelayed(() -> {
                                 if (hiddenWebView == null) return;
                                 hiddenWebView.evaluateJavascript(jsCodeFinal, null);
