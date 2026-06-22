@@ -1043,29 +1043,24 @@ class ZAutoProApp(MDApp):
         
         return self.root
     def fix_permissions(self):
-        """Cấp quyền thực thi tự động cho libnode.so theo kiến trúc máy"""
+        """
+        Trên Android 10+: KHÔNG copy và chmod libnode.so sang thư mục khác.
+        Android chặn cứng W^X — file nhị phân chỉ chạy được từ nativeLibraryDir.
+        Hàm này chỉ ghi log vị trí thật của libnode.so để debug, không làm gì thêm.
+        """
         if platform == 'android':
-            import os
-            import stat
-            import platform as sys_platform
-            
-            # Tự động lấy kiến trúc chip: aarch64 (64-bit) hoặc armv7l (32-bit)
-            arch = sys_platform.machine()
-            # Map sang tên thư mục bạn đã tạo trong nodejs_backend/bin/
-            abi = "arm64-v8a" if arch == "aarch64" else "armeabi-v7a"
-            
-            # Đường dẫn linh hoạt dựa trên ABI
-            lib_path = f"/data/data/org.zauto.zauto/files/app/nodejs_backend/bin/{abi}/libnode.so"
-            
-            if os.path.exists(lib_path):
-                try:
-                    # Cấp quyền thực thi: 0755 (rwxr-xr-x)
-                    os.chmod(lib_path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
-                    print(f"✅ Đã cấp quyền cho {abi} thành công!")
-                except Exception as e:
-                    print(f"❌ Lỗi cấp quyền cho {abi}: {e}")
-            else:
-                print(f"⚠️ Không tìm thấy file tại: {lib_path}")
+            try:
+                from jnius import autoclass
+                ctx = autoclass('org.kivy.android.PythonActivity').mActivity
+                native_lib_dir = ctx.getApplicationInfo().nativeLibraryDir
+                node_path = os.path.join(native_lib_dir, 'libnode.so')
+                if os.path.exists(node_path):
+                    print(f"✅ libnode.so tồn tại tại nativeLibraryDir: {node_path}")
+                else:
+                    print(f"⚠️ libnode.so KHÔNG tồn tại tại: {node_path}")
+                    print(f"   → Cần đóng gói libnode.so vào jniLibs/arm64-v8a/ khi build APK")
+            except Exception as e:
+                print(f"fix_permissions: {e}")
     def on_start(self):
         try:
             init_db()
@@ -2225,7 +2220,7 @@ class ZAutoProApp(MDApp):
                 mark("FAIL", label, str(e))
 
         # ---------------------------------------------------------------
-        # BƯỚC 6: Node.js backend (server.js) — process còn sống?
+        # BƯỚC 6: Node.js backend — kiểm tra sâu: process + nativeLibraryDir + W^X
         # ---------------------------------------------------------------
         node_alive = False
         try:
@@ -2234,9 +2229,30 @@ class ZAutoProApp(MDApp):
                 node_alive = True
                 mark("PASS", "Tiến trình Node.js", f"PID={proc.pid} đang sống")
             elif proc is not None:
-                mark("FAIL", "Tiến trình Node.js", f"ĐÃ CHẾT (exit code={proc.returncode})")
+                mark("FAIL", "Tiến trình Node.js",
+                     f"ĐÃ CHẾT (exit code={proc.returncode}) — xem log [Node-Err] để biết lý do")
             else:
-                mark("WARN", "Tiến trình Node.js", "chưa có thông tin process (có thể đang dùng kiến trúc Java WebView thuần)")
+                # Chưa có process — kiểm tra nguyên nhân sâu hơn
+                if platform == 'android':
+                    try:
+                        from jnius import autoclass
+                        ctx = autoclass('org.kivy.android.PythonActivity').mActivity
+                        native_lib_dir = ctx.getApplicationInfo().nativeLibraryDir
+                        node_bin = os.path.join(native_lib_dir, 'libnode.so')
+                        if os.path.exists(node_bin):
+                            mark("WARN", "Tiến trình Node.js",
+                                 f"libnode.so TỒN TẠI tại {node_bin} nhưng chưa khởi động — "
+                                 f"có thể bị lỗi khi start, xem log [Node-Err]")
+                        else:
+                            mark("FAIL", "Tiến trình Node.js",
+                                 f"libnode.so KHÔNG tồn tại tại nativeLibraryDir ({native_lib_dir})\n"
+                                 f"   → CẦN: đặt libnode.so vào jniLibs/arm64-v8a/ rồi build lại APK\n"
+                                 f"   → Android 10+ chặn W^X: KHÔNG THỂ copy+chmod để chạy được\n"
+                                 f"   → App vẫn hoạt động bình thường bằng Java WebView thuần (không cần Node.js)")
+                    except Exception as e_nat:
+                        mark("WARN", "Tiến trình Node.js", f"không lấy được nativeLibraryDir: {e_nat}")
+                else:
+                    mark("WARN", "Tiến trình Node.js", "chưa khởi động (PC mode)")
         except Exception as e:
             mark("FAIL", "Tiến trình Node.js", str(e))
 
@@ -2410,7 +2426,13 @@ class ZAutoProApp(MDApp):
                         # Dọn sạch hàng đợi pythonMsgQueue cũ liên quan đến chốt, để không đọc
                         # nhầm phản hồi của 1 lệnh chốt cuốc khác đang chạy song song
                         _ZWM.sendReplyToSpecificMessage(
-                            _act, target_conv_id, "", test_text, "", time.strftime('%H:%M')
+                            _act,
+                            target_conv_id,
+                            "",
+                            test_text,
+                            "",
+                            time.strftime('%H:%M'),
+                            target_group   # groupName — tham số thứ 7 bắt buộc
                         )
 
                         # Lắng nghe pythonMsgQueue tối đa 10 giây để bắt phản hồi THẬT từ Java
@@ -3012,80 +3034,87 @@ class ZAutoProApp(MDApp):
             except Exception as e:
                 logger.error(f"Lỗi dọn dẹp on_stop: {e}")
     def start_node_server(self):
-            """Khởi động Node.js backend server.js (Hỗ trợ cả PC Windows và Android)"""
-            import subprocess
-            import shutil
-            import os
-            import threading
-            
-            try:
-                base = os.path.dirname(os.path.abspath(__file__))
-                server_script = os.path.join(base, 'nodejs_backend', 'server.js')
-                node_cwd = os.path.join(base, 'nodejs_backend')
+        """
+        Khởi động Node.js server.js.
+        
+        Android 10+: KHÔNG copy libnode.so — chạy trực tiếp từ nativeLibraryDir.
+        nativeLibraryDir là thư mục DUY NHẤT Android cho phép execute file nhị phân.
+        Copy sang chỗ khác rồi chmod sẽ bị chặn W^X, không bao giờ chạy được.
+        
+        Yêu cầu build APK: đặt libnode.so vào jniLibs/arm64-v8a/ trong project Android
+        để Gradle tự cài vào nativeLibraryDir khi install APK.
+        """
+        import subprocess
+        import os
+        import threading
 
-                if platform == 'android':
+        try:
+            base = os.path.dirname(os.path.abspath(__file__))
+            server_script = os.path.join(base, 'nodejs_backend', 'server.js')
+            node_cwd = os.path.join(base, 'nodejs_backend')
+
+            if not os.path.exists(server_script):
+                logger.error(f'[Node] Không tìm thấy server.js tại: {server_script}')
+                return
+
+            if platform == 'android':
+                try:
                     from jnius import autoclass
-                    Build = autoclass('android.os.Build')
-                    
-                    # Xác định ABI ưu tiên
-                    try:
-                        abis = [str(Build.SUPPORTED_ABIS[i]) for i in range(Build.SUPPORTED_ABIS.length)]
-                    except Exception:
-                        abis = ['arm64-v8a']
-                    abi = 'arm64-v8a' if 'arm64-v8a' in abis else abis[0]
-                    
-                    # Đường dẫn file libnode.so gốc (read-only)
-                    src_node_bin = os.path.join(base, 'nodejs_backend', 'bin', abi, 'libnode.so')
-                    
-                    # Tạo thư mục writable nằm ngoài thư mục 'app' (lùi ra 1 cấp)
-                    # Ví dụ: base là /data/data/.../files/app -> files_dir là /data/data/.../files
-                    files_dir = os.path.dirname(base) 
-                    writable_dir = os.path.join(files_dir, 'node_bin')
-                    os.makedirs(writable_dir, exist_ok=True)
-                    
-                    # File thực thi đích
-                    node_bin = os.path.join(writable_dir, 'node')
-                    
-                    if not os.path.exists(src_node_bin):
-                        logger.error(f'Không tìm thấy node binary gốc tại: {src_node_bin}')
-                        return
-                    
-                    # Chỉ copy và chmod nếu file đích chưa tồn tại 
-                    # (hoặc bạn có thể thêm logic so sánh kích thước file để update phiên bản mới)
-                    if not os.path.exists(node_bin):
-                        shutil.copy2(src_node_bin, node_bin)
-                        os.chmod(node_bin, 0o755)  # Cấp quyền thực thi trên thư mục writable
-                        logger.info(f'Đã copy và chmod node binary sang: {node_bin}')
-                else:
-                    node_bin = 'node'  # Chạy trên PC bằng Node cài sẵn
+                    ctx = autoclass('org.kivy.android.PythonActivity').mActivity
+                    native_lib_dir = ctx.getApplicationInfo().nativeLibraryDir
+                except Exception as e_ctx:
+                    logger.error(f'[Node] Không lấy được nativeLibraryDir: {e_ctx}')
+                    return
 
-                env = os.environ.copy()
-                env['NODE_PATH'] = os.path.join(node_cwd, 'node_modules')
-                is_windows = os.name == 'nt' and platform != 'android'
+                # Chạy trực tiếp từ nativeLibraryDir — đây là cách DUY NHẤT hợp lệ trên Android 10+
+                node_bin = os.path.join(native_lib_dir, 'libnode.so')
 
-                proc = subprocess.Popen(
-                    [node_bin, server_script],
-                    cwd=node_cwd, env=env,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    shell=True if is_windows else False
-                )
-                self.node_process = proc  # Lưu lại để Deep Check kiểm tra tiến trình còn sống hay đã chết
-                logger.info(f'Node.js server đã khởi động ngầm thành công, PID={proc.pid}')
+                if not os.path.exists(node_bin):
+                    logger.error(
+                        f'[Node] libnode.so KHÔNG tồn tại tại nativeLibraryDir: {node_bin}\n'
+                        f'       → Cần đặt libnode.so vào jniLibs/arm64-v8a/ rồi build lại APK.\n'
+                        f'       → Node.js sẽ bị bỏ qua, app vẫn chạy bằng Java WebView thuần.'
+                    )
+                    return
 
-                # Đọc luồng dữ liệu log tránh đầy bộ đệm treo tiến trình
-                def log_stream(stream, prefix):
-                    try:
-                        for line in iter(stream.readline, b''):
-                            msg = line.decode('utf-8', errors='ignore').strip()
-                            if msg: logger.info(f'[{prefix}] {msg}')
-                    except: pass
-                    finally: stream.close()
+                logger.info(f'[Node] Dùng libnode.so từ nativeLibraryDir: {node_bin}')
 
-                threading.Thread(target=log_stream, args=(proc.stdout, 'Node-Out'), daemon=True).start()
-                threading.Thread(target=log_stream, args=(proc.stderr, 'Node-Err'), daemon=True).start()
+            else:
+                # PC: dùng node cài sẵn trong PATH
+                import shutil
+                node_bin = shutil.which('node') or 'node'
+                logger.info(f'[Node] PC mode, node binary: {node_bin}')
 
-            except Exception as e:
-                logger.error(f'Lỗi nghiêm trọng khi khởi động Node server: {e}')
+            env = os.environ.copy()
+            env['NODE_PATH'] = os.path.join(node_cwd, 'node_modules')
+            is_windows = os.name == 'nt' and platform != 'android'
+
+            proc = subprocess.Popen(
+                [node_bin, server_script],
+                cwd=node_cwd, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                shell=True if is_windows else False
+            )
+            self.node_process = proc
+            logger.info(f'[Node] Đã khởi động server.js, PID={proc.pid}')
+
+            # Đọc stdout/stderr để tránh đầy buffer treo tiến trình
+            def log_stream(stream, prefix):
+                try:
+                    for line in iter(stream.readline, b''):
+                        msg = line.decode('utf-8', errors='ignore').strip()
+                        if msg:
+                            logger.info(f'[{prefix}] {msg}')
+                except Exception:
+                    pass
+                finally:
+                    stream.close()
+
+            threading.Thread(target=log_stream, args=(proc.stdout, 'Node-Out'), daemon=True).start()
+            threading.Thread(target=log_stream, args=(proc.stderr, 'Node-Err'), daemon=True).start()
+
+        except Exception as e:
+            logger.error(f'[Node] Lỗi khởi động: {e}')
     
     def check_for_update(self):
         """Hàm tự động gửi yêu cầu kiểm tra phiên bản từ server Gist"""
